@@ -1,0 +1,19 @@
+---
+- name: Poll rsync progress until the local copy is verified
+  command:
+    argv:
+      - bash
+      - "{{ playbook_dir }}/scripts/backup_proxmox_rsync_poll.sh"
+  environment:
+    PROXMOX_VM_ID: "{{ proxmox_vm_id }}"
+    PROXMOX_INVENTORY_HOSTNAME: "{{ inventory_hostname }}"
+    PROXMOX_RSYNC_LOG_FILE: "{{ proxmox_rsync_log_file }}"
+    PROXMOX_RSYNC_LOCAL_BACKUP_FILE: "{{ proxmox_rsync_local_backup_file }}"
+    PROXMOX_REMOTE_BACKUP_SIZE: "{{ proxmox_remote_backup_size | int }}"
+    PROXMOX_RSYNC_JOB_ID: "{{ proxmox_rsync_job.ansible_job_id | default('') }}"
+    PROXMOX_RSYNC_POLL_ATTEMPTS: "{{ proxmox_rsync_poll_attempts | int }}"
+    PROXMOX_RSYNC_POLL_INTERVAL: "{{ proxmox_rsync_progress_interval | int }}"
+  register: proxmox_rsync_result
+  delegate_to: localhost
+  become: false
+  changed_when: false

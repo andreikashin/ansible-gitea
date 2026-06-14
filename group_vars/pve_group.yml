@@ -1,0 +1,21 @@
+---
+# Shared Proxmox VE backup settings for the pve_group inventory group.
+# Sensitive local paths are not stored here.
+# The per-host local backup folder is assembled from proxmox_backup_local_dir plus
+# proxmox_backup_folder_name (or inventory_hostname if the folder name is not set).
+proxmox_backup_remote_dir: /var/lib/vz/dump
+proxmox_backup_host_dir: "{{ proxmox_backup_local_dir }}/{{ proxmox_backup_folder_name | default(inventory_hostname) }}"
+proxmox_backup_mode: snapshot
+proxmox_backup_compress: zstd
+proxmox_backup_async_timeout: 86400
+proxmox_backup_poll_interval: 30
+proxmox_rsync_progress_interval: 10
+proxmox_backup_config_items:
+  - src: /etc/network/interfaces
+    local_name: interfaces
+  - src: /etc/pve/storage.cfg
+    local_name: storage.cfg
+  - src: /etc/hosts
+    local_name: hosts
+  - src: /etc/resolv.conf
+    local_name: resolv.conf

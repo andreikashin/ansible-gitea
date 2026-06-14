@@ -1,0 +1,8 @@
+# Copy this file to host_vars/pve1.yml for local use.
+# When Ansible runs from WSL, Windows D:\backup is mounted as /mnt/d/backup.
+# The backup will be written to /mnt/d/backup/pve1.
+proxmox_backup_folder_name: pve105
+proxmox_backup_local_dir: /mnt/с/backup
+proxmox_backup_vm_ids:
+  - 101
+  - 103

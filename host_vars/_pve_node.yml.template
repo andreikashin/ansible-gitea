@@ -1,0 +1,9 @@
+ansible_host: 192.168.1.10
+ansible_user: root
+
+# Optional: use a stable folder name for this Proxmox node or cluster.
+# proxmox_backup_folder_name: pve-cluster-1
+
+# Sensitive/local destination path for fetched backups and config files.
+# Keep this in host_vars so it does not end up in the public repository.
+proxmox_backup_local_dir: 'C:\Users\blabla\Proxmox'

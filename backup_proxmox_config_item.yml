@@ -1,0 +1,28 @@
+---
+- name: Backup a single Proxmox host configuration file
+  block:
+    - name: Copy configuration file to local destination
+      fetch:
+        src: "{{ proxmox_config_item.src }}"
+        dest: "{{ proxmox_backup_host_dir }}/"
+        flat: true
+      become: false
+      register: proxmox_config_fetch_result
+
+    - name: Remember copied configuration file
+      set_fact:
+        proxmox_copied_config_files: "{{ (proxmox_copied_config_files | default([])) + [proxmox_config_item.local_name] }}"
+      changed_when: false
+
+  rescue:
+    - name: Record failed configuration file
+      set_fact:
+        proxmox_failed_config_files: "{{ (proxmox_failed_config_files | default([])) + [proxmox_config_item.local_name] }}"
+      changed_when: false
+
+    - name: Report configuration copy failure
+      debug:
+        msg: >-
+          Failed to copy {{ proxmox_config_item.src }} from {{ inventory_hostname }}
+          into {{ proxmox_backup_host_dir }}. Moving on to the next configuration file.
+      changed_when: false

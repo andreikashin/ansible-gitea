@@ -1,0 +1,167 @@
+---
+- name: Backup, copy and clean a single VM
+  block:
+    - name: Run vzdump for VM
+      command:
+        argv:
+          - vzdump
+          - "{{ proxmox_vm_id }}"
+          - --mode
+          - "{{ proxmox_backup_mode }}"
+          - --compress
+          - "{{ proxmox_backup_compress }}"
+          - --dumpdir
+          - "{{ proxmox_backup_remote_dir }}"
+      async: "{{ proxmox_backup_async_timeout | int }}"
+      poll: "{{ proxmox_backup_poll_interval | int }}"
+      register: proxmox_vzdump_result
+
+    # После завершения vzdump ищем именно созданный архив VM на PVE.
+    # Выбираем самый свежий файл для данной VMID, потому что имя содержит timestamp.
+    - name: Find backup archive for this VM
+      find:
+        paths: "{{ proxmox_backup_remote_dir }}"
+        patterns: "vzdump-qemu-{{ proxmox_vm_id }}-*.vma.zst"
+        file_type: file
+      register: proxmox_vzdump_archives
+      changed_when: false
+
+    - name: Fail if no archive was created
+      fail:
+        msg: >-
+          No backup archive was found for VMID {{ proxmox_vm_id }} in {{ proxmox_backup_remote_dir }}.
+      when: proxmox_vzdump_archives.matched | int == 0
+
+    - name: Select newest archive path
+      set_fact:
+        proxmox_remote_backup_file: "{{ (proxmox_vzdump_archives.files | sort(attribute='mtime') | last).path }}"
+        proxmox_remote_backup_size: "{{ (proxmox_vzdump_archives.files | sort(attribute='mtime') | last).size | int }}"
+      changed_when: false
+
+    - name: Prepare rsync SSH key
+      set_fact:
+        proxmox_rsync_ssh_key: >-
+          {{
+            (hostvars[inventory_hostname].ansible_ssh_private_key_file | default('~/.ssh/id_rsa'))
+            | regex_replace('^~', lookup('env', 'HOME'))
+          }}
+      changed_when: false
+
+    - name: Prepare rsync transfer settings
+      set_fact:
+        proxmox_rsync_remote_user: "{{ hostvars[inventory_hostname].ansible_user | default('root') }}"
+        proxmox_rsync_remote_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+        proxmox_rsync_local_backup_file: "{{ proxmox_backup_host_dir }}/{{ proxmox_remote_backup_file | basename }}"
+        proxmox_rsync_log_file: "/tmp/ansible-rsync-{{ inventory_hostname }}-{{ proxmox_vm_id }}.log"
+        proxmox_rsync_poll_attempts: "{{ ((proxmox_backup_async_timeout | int) // (proxmox_rsync_progress_interval | int)) + 1 }}"
+        proxmox_rsync_ssh_command: >-
+          ssh -i {{ proxmox_rsync_ssh_key }}
+          -p {{ hostvars[inventory_hostname].ansible_port | default(hostvars[inventory_hostname].ansible_ssh_port | default(22)) }}
+          -o ConnectTimeout=15
+          -o BatchMode=yes
+          -o ServerAliveInterval=15
+          -o ServerAliveCountMax=4
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+      changed_when: false
+
+    - name: Initialize rsync progress tracking
+      set_fact:
+        proxmox_rsync_finished: 0
+        proxmox_rsync_result: {}
+        proxmox_rsync_copy_verified: false
+        proxmox_rsync_poll_count: 0
+        proxmox_rsync_last_progress_line: ""
+        proxmox_rsync_progress_stable_count: 0
+      changed_when: false
+
+    - name: Remove stale rsync progress log
+      file:
+        path: "{{ proxmox_rsync_log_file }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+
+    - name: Start rsync archive transfer in background
+      shell: >-
+        set -o pipefail;
+        rsync
+        --archive
+        --whole-file
+        --partial
+        --info=progress2
+        --human-readable
+        --protect-args
+        --timeout=600
+        -e {{ proxmox_rsync_ssh_command | quote }}
+        {{ (proxmox_rsync_remote_user ~ '@' ~ proxmox_rsync_remote_host ~ ':' ~ proxmox_remote_backup_file) | quote }}
+        {{ (proxmox_backup_host_dir ~ '/') | quote }}
+        2>&1 | tr '\r' '\n' | tee {{ proxmox_rsync_log_file | quote }}
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      async: "{{ proxmox_backup_async_timeout | int }}"
+      poll: 0
+      register: proxmox_rsync_job
+
+    - name: Poll rsync progress until the copy finishes
+      include_tasks: backup_proxmox_rsync_poll.yml
+
+    # К моменту, когда poll-скрипт подтвердил совпадение размеров, фоновый rsync
+    # фактически завершён. Снимаем оставшийся async-статус, чтобы не копить
+    # «висящие» job-файлы в ~/.ansible_async на control-ноде.
+    - name: Clean up background rsync async job
+      async_status:
+        jid: "{{ proxmox_rsync_job.ansible_job_id }}"
+        mode: cleanup
+      delegate_to: localhost
+      become: false
+      when: proxmox_rsync_job.ansible_job_id is defined
+      changed_when: false
+
+    # Сначала копируем архив на локальный путь через rsync, и только после
+    # успешного переноса удаляем исходный файл на PVE, чтобы не потерять копию.
+    - name: Delete backup archive from Proxmox after successful copy
+      file:
+        path: "{{ proxmox_remote_backup_file }}"
+        state: absent
+      when: proxmox_rsync_result.rc | default(1) | int == 0
+      register: proxmox_remote_delete_result
+      ignore_errors: true
+
+    - name: Warn if remote cleanup failed
+      debug:
+        msg: >-
+          Backup for VMID {{ proxmox_vm_id }} was copied to {{ proxmox_backup_host_dir }},
+          but the source file could not be removed from {{ proxmox_backup_remote_dir }}.
+      when:
+        - proxmox_rsync_result.rc | default(1) | int == 0
+        - proxmox_remote_delete_result is defined
+        - proxmox_remote_delete_result.failed | default(false)
+  rescue:
+    - name: Record failed VMID
+      set_fact:
+        proxmox_failed_vmids: "{{ (proxmox_failed_vmids | default([])) + [proxmox_vm_id | int] }}"
+      changed_when: false
+
+    # Реальный прогресс/ошибки rsync пишутся в локальный лог-файл, а не в stdout
+    # poll-скрипта, поэтому для диагностики читаем хвост этого лога.
+    - name: Read rsync log tail for diagnostics
+      command: tail -n 20 {{ proxmox_rsync_log_file | quote }}
+      delegate_to: localhost
+      become: false
+      register: proxmox_rsync_log_tail
+      changed_when: false
+      failed_when: false
+      when: proxmox_rsync_log_file is defined
+
+    - name: Report VM backup failure
+      debug:
+        msg: >-
+          Backup flow failed for VMID {{ proxmox_vm_id }} on {{ inventory_hostname }}.
+          vzdump rc: {{ proxmox_vzdump_result.rc if proxmox_vzdump_result is defined else 'n/a' }}.
+          rsync rc: {{ proxmox_rsync_result.rc if proxmox_rsync_result is defined else 'n/a' }}.
+          rsync log tail: {{ proxmox_rsync_log_tail.stdout | default('n/a') | trim | default('n/a', true) if proxmox_rsync_log_tail is defined else 'n/a' }}.
+          Moving on to the next VM.
+      changed_when: false

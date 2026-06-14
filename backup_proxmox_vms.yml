@@ -1,0 +1,259 @@
+---
+# Пример inventory-группы для Proxmox-нод, которые нужно бэкапить:
+# [pve_group]
+# имена узлов берутся из вашего inventory
+#
+# Общие параметры бэкапа лежат в `group_vars/pve_group.yml`.
+# Секретный/локальный путь назначения (`proxmox_backup_local_dir`) должен лежать
+# в `host_vars/<pve-host>.yml`.
+# Если нужен отдельный каталог для конкретного узла/кластера, задайте
+# `proxmox_backup_folder_name` в inventory или host_vars; иначе используется `inventory_hostname`.
+
+- name: Check rsync on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check rsync on control node
+      command: rsync --version
+      register: control_rsync_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if rsync is missing on control node
+      fail:
+        msg: >-
+          rsync is required on the control node (localhost/WSL) to copy backup archives.
+          Please install it manually before rerunning this playbook, for example:
+          sudo apt install rsync
+      when: control_rsync_check.rc != 0
+
+    # `--info=progress2` поддерживается только начиная с rsync 3.1, поэтому
+    # одной проверки наличия недостаточно — сверяем версию.
+    - name: Determine control node rsync version
+      set_fact:
+        control_rsync_version: >-
+          {{ control_rsync_check.stdout | default('') | regex_search('[0-9]+\.[0-9]+(?:\.[0-9]+)?') | default('0.0', true) }}
+      when: control_rsync_check.rc == 0
+
+    - name: Fail if control node rsync is older than 3.1
+      fail:
+        msg: >-
+          rsync {{ control_rsync_version }} on the control node is too old.
+          rsync >= 3.1 is required for the --info=progress2 progress output.
+          Please upgrade rsync, for example: sudo apt install --only-upgrade rsync
+      when:
+        - control_rsync_check.rc == 0
+        - control_rsync_version is version('3.1', '<')
+
+- name: Back up Proxmox VE virtual machines
+  hosts: "{{ proxmox_target | default('pve_group') }}"
+  become: true
+  gather_facts: false
+  serial: 1
+
+  pre_tasks:
+    - name: Check rsync on remote host
+      command: rsync --version
+      register: proxmox_rsync_check
+      changed_when: false
+      failed_when: false
+
+    - name: Install rsync on remote host
+      apt:
+        name: rsync
+        state: present
+        update_cache: yes
+      when: proxmox_rsync_check.rc != 0
+
+    - name: Ensure remote dumpdir exists
+      file:
+        path: "{{ proxmox_backup_remote_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Имя PVE-ноды в кластере может не совпадать с inventory_hostname
+    # (FQDN, иной алиас, регистр). Берём реальное имя узла с самого хоста,
+    # с возможностью переопределить через proxmox_node_name.
+    - name: Detect local Proxmox node name
+      command: hostname
+      register: proxmox_hostname_result
+      changed_when: false
+      when: proxmox_node_name is not defined
+
+    - name: Resolve Proxmox node name
+      set_fact:
+        proxmox_node_name: >-
+          {{
+            proxmox_node_name
+            | default((proxmox_hostname_result.stdout | default('') | trim) | default(inventory_hostname, true), true)
+          }}
+      changed_when: false
+
+    - name: Read Proxmox cluster VM inventory
+      command:
+        argv:
+          - pvesh
+          - get
+          - /cluster/resources
+          - --type
+          - vm
+          - --output-format
+          - json
+      register: proxmox_cluster_resources
+      changed_when: false
+
+    # Берём VMID из cluster resources API и фильтруем только QEMU ВМ текущего узла.
+    - name: Extract VMIDs from cluster resources
+      set_fact:
+        proxmox_discovered_vm_ids: >-
+          {{
+            (proxmox_cluster_resources.stdout | default('[]') | from_json)
+            | selectattr('node', 'equalto', proxmox_node_name)
+            | selectattr('type', 'equalto', 'qemu')
+            | map(attribute='vmid')
+            | map('int')
+            | sort
+            | list
+          }}
+      changed_when: false
+
+    - name: Normalize requested VMID list
+      set_fact:
+        proxmox_requested_vm_ids: >-
+          {{
+            proxmox_backup_vm_ids
+            | default([])
+            | map('int')
+            | unique
+            | sort
+            | list
+          }}
+      changed_when: false
+
+    - name: Build VMID list for this host
+      set_fact:
+        proxmox_vm_ids: >-
+          {{
+            proxmox_discovered_vm_ids
+            if proxmox_requested_vm_ids | length == 0
+            else proxmox_requested_vm_ids
+          }}
+      changed_when: false
+
+    - name: Calculate missing requested VMIDs
+      set_fact:
+        proxmox_missing_requested_vm_ids: >-
+          {{ proxmox_requested_vm_ids | difference(proxmox_discovered_vm_ids) }}
+      changed_when: false
+
+    - name: Show VMID selection diagnostics
+      debug:
+        msg: >-
+          Proxmox node name resolved to '{{ proxmox_node_name }}'.
+          Discovered VMIDs on {{ inventory_hostname }}: {{
+            proxmox_discovered_vm_ids | join(', ') if proxmox_discovered_vm_ids | length > 0 else 'none'
+          }}.
+          Requested VMIDs: {{
+            proxmox_requested_vm_ids | join(', ') if proxmox_requested_vm_ids | length > 0 else 'none'
+          }}.
+          Missing requested VMIDs: {{
+            proxmox_missing_requested_vm_ids | join(', ') if proxmox_missing_requested_vm_ids | length > 0 else 'none'
+          }}.
+      changed_when: false
+
+    - name: Fail if requested VMIDs are missing
+      fail:
+        msg: >-
+          Requested VMIDs were not found on {{ inventory_hostname }}: {{
+            proxmox_missing_requested_vm_ids | join(', ')
+          }}.
+      when:
+        - proxmox_requested_vm_ids | length > 0
+        - proxmox_missing_requested_vm_ids | length > 0
+
+    - name: Initialize failed VM list
+      set_fact:
+        proxmox_failed_vmids: []
+      changed_when: false
+
+    - name: Initialize failed config file list
+      set_fact:
+        proxmox_failed_config_files: []
+      changed_when: false
+
+    - name: Initialize copied config file list
+      set_fact:
+        proxmox_copied_config_files: []
+      changed_when: false
+
+    - name: Note when no VMs exist
+      debug:
+        msg: >-
+          No VMs were found on {{ inventory_hostname }}.
+          VM backup loop will be skipped, but configuration files will still be copied.
+      when: proxmox_vm_ids | length == 0
+      changed_when: false
+
+    - name: Ensure local backup path is configured
+      assert:
+        that:
+          - proxmox_backup_local_dir is defined
+          - proxmox_backup_local_dir | length > 0
+        fail_msg: >-
+          Local backup destination is not configured.
+      changed_when: false
+
+    - name: Ensure local backup destination exists
+      file:
+        path: "{{ proxmox_backup_host_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+  tasks:
+    # Строгая последовательность обеспечивается в двух местах:
+    # 1) `serial: 1` не позволяет разным PVE-нодам бэкапиться параллельно.
+    # 2) `include_tasks` обрабатывает одну VM за итерацию: сначала vzdump,
+    #    потом копирование на локальный путь, затем удаление архива с PVE.
+    # `async` + `poll` нужны, чтобы долгий vzdump не обрывал выполнение Ansible.
+    - name: Back up, copy and clean each VM sequentially
+      include_tasks: backup_proxmox_vm_item.yml
+      loop: "{{ proxmox_vm_ids }}"
+      loop_control:
+        loop_var: proxmox_vm_id
+        label: "VMID {{ proxmox_vm_id }}"
+
+  post_tasks:
+    # Когда все VM-архивы уже лежат в локальной папке узла,
+    # рядом копируем и конфиги самого PVE.
+    - name: Back up Proxmox host configuration files
+      include_tasks: backup_proxmox_config_item.yml
+      loop: "{{ proxmox_backup_config_items }}"
+      loop_control:
+        loop_var: proxmox_config_item
+        label: "{{ proxmox_config_item.local_name }}"
+
+    - name: Report backup summary
+      debug:
+        msg: >-
+          Backup finished on {{ inventory_hostname }}.
+          Local artifacts are in {{ proxmox_backup_host_dir }}.
+          Successful VMIDs: {{
+            (proxmox_vm_ids | reject('in', proxmox_failed_vmids) | list) | join(', ')
+            if proxmox_vm_ids | length > 0 else 'none'
+          }}.
+          Failed VMIDs: {{
+            proxmox_failed_vmids | join(', ')
+            if proxmox_failed_vmids | length > 0 else 'none'
+          }}.
+          Config files copied next to the VM backups: {{
+            proxmox_copied_config_files | join(', ')
+            if proxmox_copied_config_files | length > 0 else 'none'
+          }}.
+          Failed config files: {{
+            proxmox_failed_config_files | join(', ')
+            if proxmox_failed_config_files | length > 0 else 'none'
+          }}.
+      changed_when: false
