@@ -49,7 +49,7 @@
 
     - name: Prepare rsync transfer settings
       set_fact:
-        proxmox_rsync_remote_user: "{{ hostvars[inventory_hostname].ansible_user | default('root') }}"
+        proxmox_rsync_remote_user: "{{ proxmox_ssh_user | default(hostvars[inventory_hostname].ansible_user | default('root')) }}"
         proxmox_rsync_remote_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
         proxmox_rsync_local_backup_file: "{{ proxmox_backup_host_dir }}/{{ proxmox_remote_backup_file | basename }}"
         proxmox_rsync_log_file: "/tmp/ansible-rsync-{{ inventory_hostname }}-{{ proxmox_vm_id }}.log"

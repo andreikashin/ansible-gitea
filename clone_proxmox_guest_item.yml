@@ -1,0 +1,193 @@
+---
+- name: Clone a single guest from source to target
+  block:
+    - name: Set per-guest facts
+      set_fact:
+        clone_vmid: "{{ clone_guest.vmid | int }}"
+        clone_type: "{{ clone_guest.type }}"
+        clone_is_template: "{{ (clone_guest.template | default(0) | int) == 1 }}"
+        clone_guest_status: "{{ clone_guest.status | default('stopped') }}"
+      changed_when: false
+
+    - name: Compute vzdump mode and archive pattern
+      set_fact:
+        clone_vzdump_mode: "{{ 'snapshot' if clone_guest_status == 'running' else 'stop' }}"
+        clone_archive_pattern: >-
+          {{ 'vzdump-qemu-' ~ clone_vmid ~ '-*.vma.zst'
+             if clone_type == 'qemu'
+             else 'vzdump-lxc-' ~ clone_vmid ~ '-*.tar.zst' }}
+        clone_target_conf: >-
+          {{ '/etc/pve/qemu-server/' ~ clone_vmid ~ '.conf'
+             if clone_type == 'qemu'
+             else '/etc/pve/lxc/' ~ clone_vmid ~ '.conf' }}
+      changed_when: false
+
+    - name: Check whether guest already exists on target
+      stat:
+        path: "{{ clone_target_conf }}"
+      register: clone_existing_conf
+
+    - name: Skip guest that already exists (force disabled)
+      block:
+        - name: Record skipped guest
+          set_fact:
+            clone_skipped_ids: "{{ (clone_skipped_ids | default([])) + [clone_vmid | int] }}"
+          changed_when: false
+
+        - name: Note skipped guest
+          debug:
+            msg: >-
+              {{ clone_type | upper }} {{ clone_vmid }} already exists on
+              {{ clone_target }}. Skipping (set clone_force=true to overwrite).
+          changed_when: false
+      when:
+        - clone_existing_conf.stat.exists
+        - not (clone_force | bool)
+
+    - name: Back up, transfer and restore guest
+      when: not clone_existing_conf.stat.exists or (clone_force | bool)
+      block:
+        - name: Run vzdump for guest on source
+          command:
+            argv:
+              - vzdump
+              - "{{ clone_vmid }}"
+              - --mode
+              - "{{ clone_vzdump_mode }}"
+              - --compress
+              - "{{ clone_backup_compress }}"
+              - --dumpdir
+              - "{{ clone_remote_dumpdir }}"
+          async: "{{ clone_backup_async_timeout | int }}"
+          poll: "{{ clone_backup_poll_interval | int }}"
+          register: clone_vzdump_result
+          delegate_to: "{{ clone_source }}"
+
+        - name: Find backup archive on source
+          find:
+            paths: "{{ clone_remote_dumpdir }}"
+            patterns: "{{ clone_archive_pattern }}"
+            file_type: file
+          register: clone_archives
+          changed_when: false
+          delegate_to: "{{ clone_source }}"
+
+        - name: Fail if no archive was created
+          fail:
+            msg: >-
+              No backup archive was found for {{ clone_type | upper }} {{ clone_vmid }}
+              in {{ clone_remote_dumpdir }} on {{ clone_source }}.
+          when: clone_archives.matched | int == 0
+
+        - name: Select newest archive on source
+          set_fact:
+            clone_source_archive: "{{ (clone_archives.files | sort(attribute='mtime') | last).path }}"
+          changed_when: false
+
+        - name: Build pull SSH command
+          set_fact:
+            clone_pull_ssh: >-
+              ssh -i {{ clone_ssh_key_path }}
+              -p {{ hostvars[clone_source].ansible_port | default(22) }}
+              -o ConnectTimeout=15
+              -o BatchMode=yes
+              -o ServerAliveInterval=15
+              -o ServerAliveCountMax=4
+              -o StrictHostKeyChecking=no
+              -o UserKnownHostsFile=/dev/null
+            clone_source_addr: "{{ hostvars[clone_source].ansible_host | default(clone_source) }}"
+            clone_source_user: "{{ hostvars[clone_source].ansible_user | default('root') }}"
+            clone_local_archive: "{{ clone_remote_dumpdir }}/{{ clone_source_archive | basename }}"
+          changed_when: false
+
+        - name: Pull archive from source to target
+          shell: >-
+            set -o pipefail;
+            rsync
+            --archive
+            --whole-file
+            --partial
+            --info=progress2
+            --human-readable
+            --protect-args
+            --timeout=600
+            -e {{ clone_pull_ssh | quote }}
+            {{ (clone_source_user ~ '@' ~ clone_source_addr ~ ':' ~ clone_source_archive) | quote }}
+            {{ (clone_remote_dumpdir ~ '/') | quote }}
+          args:
+            executable: /bin/bash
+          register: clone_pull_result
+          changed_when: clone_pull_result.rc == 0
+
+        - name: Restore QEMU VM on target
+          command:
+            argv: >-
+              {{
+                ['qmrestore', clone_local_archive, clone_vmid | string,
+                 '--storage', clone_target_storage]
+                + (['--force'] if (clone_force | bool) else [])
+              }}
+          register: clone_restore_qemu
+          when: clone_type == 'qemu'
+
+        - name: Restore LXC container on target
+          command:
+            argv: >-
+              {{
+                ['pct', 'restore', clone_vmid | string, clone_local_archive,
+                 '--storage', clone_target_storage]
+                + (['--force'] if (clone_force | bool) else [])
+              }}
+          register: clone_restore_lxc
+          when: clone_type == 'lxc'
+
+        - name: Mark restored QEMU guest as template
+          command:
+            argv:
+              - qm
+              - template
+              - "{{ clone_vmid }}"
+          when:
+            - clone_type == 'qemu'
+            - clone_is_template | bool
+
+        - name: Mark restored LXC guest as template
+          command:
+            argv:
+              - pct
+              - template
+              - "{{ clone_vmid }}"
+          when:
+            - clone_type == 'lxc'
+            - clone_is_template | bool
+
+        - name: Remove pulled archive on target
+          file:
+            path: "{{ clone_local_archive }}"
+            state: absent
+
+        - name: Remove backup archive on source
+          file:
+            path: "{{ clone_source_archive }}"
+            state: absent
+          delegate_to: "{{ clone_source }}"
+
+        - name: Record restored guest
+          set_fact:
+            clone_done_ids: "{{ (clone_done_ids | default([])) + [clone_vmid | int] }}"
+          changed_when: false
+
+  rescue:
+    - name: Record failed guest
+      set_fact:
+        clone_failed_ids: "{{ (clone_failed_ids | default([])) + [clone_vmid | int] }}"
+      changed_when: false
+
+    - name: Report guest clone failure
+      debug:
+        msg: >-
+          Clone failed for {{ clone_type | default('guest') | upper }} {{ clone_vmid | default('?') }}.
+          vzdump rc: {{ clone_vzdump_result.rc if clone_vzdump_result is defined else 'n/a' }}.
+          pull rc: {{ clone_pull_result.rc if clone_pull_result is defined else 'n/a' }}.
+          Moving on to the next guest.
+      changed_when: false

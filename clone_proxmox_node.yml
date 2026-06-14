@@ -1,0 +1,300 @@
+---
+# Клонирование одной Proxmox-ноды на другую (pull-режим).
+#
+# Идея: на новой чистой ноде (clone_target, напр. pve002) запускается этот
+# плейбук. Он по очереди для каждого гостя источника (clone_source, напр. pve001):
+#   1) делает vzdump на источнике;
+#   2) тянет архив по SSH напрямую с источника на целевую ноду (rsync pull);
+#   3) восстанавливает гостя на целевой ноде (qmrestore / pct restore) с теми же
+#      VMID/CTID и целевым хранилищем clone_target_storage;
+#   4) помечает шаблоны как template;
+#   5) чистит временные архивы на обеих нодах.
+# После гостей переносятся файлы ISO/CT-шаблонов и (опционально) staging-копия
+# конфигов источника.
+#
+# Обязательные переменные (через -e или host_vars):
+#   clone_source          - имя ноды-источника в inventory (напр. pve1)
+#   clone_target          - имя целевой ноды в inventory (напр. pve3)
+#   clone_target_storage  - хранилище на целевой ноде для restore (напр. local-lvm)
+#
+# Пример запуска:
+#   ansible-playbook clone_proxmox_node.yml \
+#     -e clone_source=pve1 -e clone_target=pve3 -e clone_target_storage=local-lvm
+
+- name: Check rsync on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Validate clone target/source are provided and distinct
+      assert:
+        that:
+          - clone_source is defined and clone_source | length > 0
+          - clone_target is defined and clone_target | length > 0
+          - clone_source != clone_target
+          - clone_target_storage is defined and clone_target_storage | length > 0
+        fail_msg: >-
+          You must set clone_source, clone_target (different hosts) and
+          clone_target_storage, e.g.
+          -e clone_source=pve1 -e clone_target=pve3 -e clone_target_storage=local-lvm
+
+- name: Clone a Proxmox node onto a fresh node (pull mode)
+  hosts: "{{ clone_target }}"
+  become: true
+  gather_facts: false
+  # Гарантируем наличие путей к Proxmox CLI (pvesh в /usr/bin, vzdump/qm/pct/qmrestore
+  # в /usr/sbin) при become из не-root пользователя. Применяется и к delegate_to-задачам.
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  vars:
+    # Какие типы объектов переносить.
+    clone_include_qemu: true
+    clone_include_lxc: true
+    clone_include_templates: true
+    clone_include_template_files: true
+
+    # Необязательный явный список VMID/CTID для переноса. Пусто = все гости источника.
+    clone_guest_ids: []
+
+    # Каталог дампов на обеих нодах.
+    clone_remote_dumpdir: /var/lib/vz/dump
+
+    # Выделенный ключ, который целевая нода использует для pull с источника.
+    clone_ssh_key_path: /root/.ssh/id_pve_clone
+
+    # Поведение restore: пропускать существующие VMID или перезаписывать (--force).
+    clone_force: false
+
+    # Тайминги vzdump.
+    clone_backup_async_timeout: 86400
+    clone_backup_poll_interval: 30
+    clone_backup_compress: zstd
+
+    # Каталоги с файлами шаблонов/ISO для переноса (rsync файлов, без restore).
+    clone_template_dirs:
+      - /var/lib/vz/template/iso
+      - /var/lib/vz/template/cache
+
+    # Куда складывать staging-копию конфигов источника на целевой ноде.
+    # По умолчанию конфиги НЕ применяются к системе (это сломало бы сеть клона),
+    # а только сохраняются для ручного просмотра.
+    clone_config_stage_dir: /root/pve-clone-source-config
+    clone_config_items:
+      - /etc/network/interfaces
+      - /etc/pve/storage.cfg
+      - /etc/hosts
+      - /etc/resolv.conf
+
+  pre_tasks:
+    - name: Ensure rsync is installed on target and source
+      apt:
+        name: rsync
+        state: present
+        update_cache: yes
+      delegate_to: "{{ item }}"
+      loop:
+        - "{{ clone_target }}"
+        - "{{ clone_source }}"
+
+    - name: Ensure dumpdir exists on target and source
+      file:
+        path: "{{ clone_remote_dumpdir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: "{{ item }}"
+      loop:
+        - "{{ clone_target }}"
+        - "{{ clone_source }}"
+
+    # Целевой ноде нужен SSH-доступ к источнику, чтобы тянуть дампы.
+    - name: Ensure clone SSH keypair exists on target node
+      command: >-
+        ssh-keygen -t ed25519 -N "" -f {{ clone_ssh_key_path | quote }} -q
+      args:
+        creates: "{{ clone_ssh_key_path }}"
+
+    - name: Read clone public key from target node
+      slurp:
+        src: "{{ clone_ssh_key_path }}.pub"
+      register: clone_pubkey_slurp
+
+    - name: Store clone public key
+      set_fact:
+        clone_pubkey: "{{ clone_pubkey_slurp.content | b64decode | trim }}"
+      changed_when: false
+
+    - name: Authorize target node key on source node
+      shell: |
+        set -e
+        install -d -m 700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        chmod 600 ~/.ssh/authorized_keys
+        grep -qxF {{ clone_pubkey | quote }} ~/.ssh/authorized_keys || echo {{ clone_pubkey | quote }} >> ~/.ssh/authorized_keys
+      args:
+        executable: /bin/bash
+      changed_when: false
+      delegate_to: "{{ clone_source }}"
+
+    - name: Detect source Proxmox node name
+      command: hostname
+      register: clone_source_hostname
+      changed_when: false
+      delegate_to: "{{ clone_source }}"
+
+    - name: Resolve source node name
+      set_fact:
+        clone_source_node: "{{ clone_source_node | default(clone_source_hostname.stdout | trim) }}"
+      changed_when: false
+
+    - name: Read source cluster resources
+      command:
+        argv:
+          - /usr/bin/pvesh
+          - get
+          - /cluster/resources
+          - --type
+          - vm
+          - --output-format
+          - json
+      register: clone_source_resources
+      changed_when: false
+      delegate_to: "{{ clone_source }}"
+
+    # Строим список гостей источника с типом (qemu/lxc), статусом и флагом template.
+    - name: Build candidate guest list from source
+      set_fact:
+        clone_source_guests: >-
+          {{
+            (clone_source_resources.stdout | default('[]') | from_json)
+            | selectattr('node', 'equalto', clone_source_node)
+            | selectattr('type', 'in', ['qemu', 'lxc'])
+            | list
+          }}
+      changed_when: false
+
+    - name: Determine allowed guest types
+      set_fact:
+        clone_type_filter: >-
+          {{ (['qemu'] if clone_include_qemu else [])
+             + (['lxc'] if clone_include_lxc else []) }}
+      changed_when: false
+
+    - name: Filter guests by requested types
+      set_fact:
+        clone_guests: "{{ clone_source_guests | selectattr('type', 'in', clone_type_filter) | list }}"
+      changed_when: false
+
+    # Поле 'template' у обычных гостей может отсутствовать или быть 0;
+    # rejectattr оставляет такие записи и убирает только template == 1.
+    - name: Drop templates when not requested
+      set_fact:
+        clone_guests: "{{ clone_guests | rejectattr('template', 'equalto', 1) | list }}"
+      changed_when: false
+      when: not (clone_include_templates | bool)
+
+    - name: Restrict to explicit guest ids when provided
+      set_fact:
+        clone_guests: >-
+          {{
+            clone_guests
+            | selectattr('vmid', 'in', (clone_guest_ids | map('int') | list))
+            | list
+          }}
+      when: clone_guest_ids | length > 0
+      changed_when: false
+
+    - name: Initialize result trackers
+      set_fact:
+        clone_failed_ids: []
+        clone_done_ids: []
+        clone_skipped_ids: []
+      changed_when: false
+
+    - name: Show clone plan
+      debug:
+        msg: >-
+          Cloning from node '{{ clone_source_node }}' ({{ clone_source }}) to
+          {{ clone_target }}. Target storage: {{ clone_target_storage }}.
+          Guests to process: {{
+            (clone_guests | map(attribute='vmid') | map('string') | join(', '))
+            if clone_guests | length > 0 else 'none'
+          }}. Force restore: {{ clone_force }}.
+      changed_when: false
+
+  tasks:
+    - name: Clone each guest sequentially
+      include_tasks: clone_proxmox_guest_item.yml
+      loop: "{{ clone_guests }}"
+      loop_control:
+        loop_var: clone_guest
+        label: "{{ clone_guest.type | upper }} {{ clone_guest.vmid }}"
+
+  post_tasks:
+    - name: Build global pull SSH command for files
+      set_fact:
+        clone_files_ssh: >-
+          ssh -i {{ clone_ssh_key_path }}
+          -p {{ hostvars[clone_source].ansible_port | default(22) }}
+          -o BatchMode=yes
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+        clone_files_source_user: "{{ hostvars[clone_source].ansible_user | default('root') }}"
+        clone_files_source_addr: "{{ hostvars[clone_source].ansible_host | default(clone_source) }}"
+      changed_when: false
+      when: clone_include_template_files | bool
+
+    - name: Ensure template/ISO target directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ clone_template_dirs }}"
+      when: clone_include_template_files | bool
+
+    - name: Pull template/ISO files from source
+      shell: >-
+        set -o pipefail;
+        rsync --archive --whole-file --partial --info=progress2 --human-readable --protect-args
+        -e {{ clone_files_ssh | quote }}
+        {{ (clone_files_source_user ~ '@' ~ clone_files_source_addr ~ ':' ~ item ~ '/') | quote }}
+        {{ (item ~ '/') | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ clone_template_dirs }}"
+      register: clone_template_files_pull
+      changed_when: clone_template_files_pull.rc == 0
+      failed_when: false
+      when: clone_include_template_files | bool
+
+    - name: Stage source host configuration files on target (not applied)
+      block:
+        - name: Ensure staging directory exists on target
+          file:
+            path: "{{ clone_config_stage_dir }}"
+            state: directory
+            mode: '0700'
+
+        - name: Copy each source config into staging dir on target
+          shell: >-
+            rsync --archive --whole-file
+            -e {{ ('ssh -i ' ~ clone_ssh_key_path ~ ' -p ' ~ (hostvars[clone_source].ansible_port | default(22)) ~ ' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null') | quote }}
+            {{ ((hostvars[clone_source].ansible_user | default('root')) ~ '@' ~ (hostvars[clone_source].ansible_host | default(clone_source)) ~ ':' ~ item) | quote }}
+            {{ (clone_config_stage_dir ~ '/') | quote }}
+          args:
+            executable: /bin/bash
+          loop: "{{ clone_config_items }}"
+          register: clone_config_copy
+          changed_when: clone_config_copy.rc == 0
+          failed_when: false
+      when: clone_config_items | length > 0
+
+    - name: Report clone summary
+      debug:
+        msg: >-
+          Clone finished on {{ clone_target }} from {{ clone_source_node }}.
+          Restored: {{ clone_done_ids | join(', ') if clone_done_ids | length > 0 else 'none' }}.
+          Skipped (already existed): {{ clone_skipped_ids | join(', ') if clone_skipped_ids | length > 0 else 'none' }}.
+          Failed: {{ clone_failed_ids | join(', ') if clone_failed_ids | length > 0 else 'none' }}.
+          Source config files staged (not applied) in {{ clone_config_stage_dir }}.
+      changed_when: false

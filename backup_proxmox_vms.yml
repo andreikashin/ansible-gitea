@@ -48,9 +48,16 @@
 
 - name: Back up Proxmox VE virtual machines
   hosts: "{{ proxmox_target | default('pve_group') }}"
+  vars:
+    proxmox_ssh_user: "{{ ansible_user | default('root') }}"
+    ansible_remote_tmp: "/tmp/.ansible-{{ proxmox_ssh_user }}"
   become: true
   gather_facts: false
   serial: 1
+  # Гарантируем наличие путей к Proxmox CLI (pvesh в /usr/bin, vzdump/qm/pct в /usr/sbin)
+  # при become из не-root пользователя с урезанным PATH.
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
   pre_tasks:
     - name: Check rsync on remote host
@@ -93,7 +100,7 @@
     - name: Read Proxmox cluster VM inventory
       command:
         argv:
-          - pvesh
+          - /usr/bin/pvesh
           - get
           - /cluster/resources
           - --type
