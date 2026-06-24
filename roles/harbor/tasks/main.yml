@@ -41,6 +41,15 @@
     state: directory
     mode: '0755'
 
+- name: Ensure Harbor DB data directory ownership
+  file:
+    path: /data/database
+    state: directory
+    owner: "999"
+    group: "999"
+    mode: '0755'
+    recurse: yes
+
 # === БЛОК 3: СКАЧИВАНИЕ И РАСПАКОВКА ===
 
 # Мы качаем инсталлер, если его нет ИЛИ если мы хотим обновить версию
