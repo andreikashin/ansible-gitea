@@ -1,0 +1,29 @@
+import com.cloudbees.plugins.credentials.CredentialsScope
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider
+import com.cloudbees.plugins.credentials.domains.Domain
+import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl
+import jenkins.model.Jenkins
+
+def credentialsId = '{{ jenkins_harbor_credentials_id }}'
+def harborServiceUser = '{{ jenkins_harbor_service_user }}'
+def harborServiceToken = '{{ jenkins_harbor_service_token }}'
+def credentialDescription = '{{ jenkins_harbor_credentials_description }}'
+
+def credentialsStore = SystemCredentialsProvider.getInstance().getStore()
+def globalDomain = Domain.global()
+def existingCredential = credentialsStore.getCredentials(globalDomain).find { it.id == credentialsId }
+
+if (existingCredential != null) {
+    credentialsStore.removeCredentials(globalDomain, existingCredential)
+}
+
+credentialsStore.addCredentials(globalDomain, new UsernamePasswordCredentialsImpl(
+    CredentialsScope.GLOBAL,
+    credentialsId,
+    credentialDescription,
+    harborServiceUser,
+    harborServiceToken
+))
+
+credentialsStore.save()
+Jenkins.instance.save()

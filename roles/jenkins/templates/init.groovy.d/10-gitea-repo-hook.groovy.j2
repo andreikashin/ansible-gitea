@@ -1,0 +1,81 @@
+import com.cloudbees.plugins.credentials.CredentialsScope
+import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider
+import com.cloudbees.plugins.credentials.domains.Domain
+import hudson.model.AbstractProject
+import hudson.model.BuildAuthorizationToken
+import jenkins.model.Jenkins
+import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl
+import org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition
+import org.jenkinsci.plugins.workflow.job.WorkflowJob
+
+def jenkins = Jenkins.instance
+def jobName = {{ jenkins_job_name | to_json }}
+def jobToken = {{ jenkins_job_token | to_json }}
+def repoOwner = {{ gitea_repo_owner | to_json }}
+def repoName = {{ gitea_repo_name | to_json }}
+def repoBranch = {{ gitea_repo_branch | default('main') | to_json }}
+def giteaHost = {{ gitea_inventory_vars.node_domain | to_json }}
+def giteaServiceUser = {{ jenkins_gitea_service_user | to_json }}
+def credentialId = {{ jenkins_gitea_credentials_id | to_json }}
+def giteaToken = {{ gitea_service_token | default('') | to_json }}
+
+def credentialsStore = SystemCredentialsProvider.getInstance().getStore()
+def globalDomain = Domain.global()
+def existingCredential = credentialsStore.getCredentials(globalDomain).find { it.id == credentialId }
+def credentialToken = giteaToken
+if (existingCredential instanceof StringCredentialsImpl) {
+    credentialToken = existingCredential.secret.plainText
+} else if (existingCredential instanceof UsernamePasswordCredentialsImpl) {
+    credentialToken = existingCredential.password.plainText
+}
+if (credentialToken) {
+    def needsUpdate = !(existingCredential instanceof UsernamePasswordCredentialsImpl) ||
+        existingCredential.username != giteaServiceUser ||
+        existingCredential.password.plainText != credentialToken
+    if (needsUpdate) {
+        if (existingCredential != null) {
+            credentialsStore.removeCredentials(globalDomain, existingCredential)
+        }
+        credentialsStore.addCredentials(globalDomain, new UsernamePasswordCredentialsImpl(
+            CredentialsScope.GLOBAL,
+            credentialId,
+            "Gitea credentials for ${repoOwner}/${repoName}",
+            giteaServiceUser,
+            credentialToken
+        ))
+    }
+}
+
+def pipelineScript = """
+node {
+    stage('Checkout') {
+        withCredentials([usernamePassword(credentialsId: '${credentialId}', usernameVariable: 'GITEA_USERNAME', passwordVariable: 'GITEA_TOKEN')]) {
+            sh '''#!/bin/sh
+set -eu
+rm -rf source
+git clone --depth 1 --branch ${repoBranch} https://$GITEA_USERNAME:$GITEA_TOKEN@${giteaHost}/${repoOwner}/${repoName}.git source
+cd source
+git rev-parse --short HEAD
+'''
+        }
+    }
+}
+"""
+
+def job = jenkins.getItem(jobName)
+if (job == null) {
+    job = jenkins.createProject(WorkflowJob, jobName)
+}
+
+def authTokenField = job.class.getDeclaredField("authToken")
+authTokenField.setAccessible(true)
+authTokenField.set(job, new BuildAuthorizationToken(jobToken))
+
+job.description = "Gitea webhook job for ${repoOwner}/${repoName}"
+job.setDefinition(new CpsFlowDefinition(pipelineScript, true))
+job.concurrentBuild = false
+job.disabled = false
+job.save()
+credentialsStore.save()
+jenkins.save()

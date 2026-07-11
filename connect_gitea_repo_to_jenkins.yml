@@ -1,0 +1,180 @@
+---
+- name: Connect a Gitea repository to Jenkins
+  hosts: "{{ jenkins_pve_target | default('pve1') }}"
+  become: yes
+  gather_facts: false
+  vars_files:
+    - secrets.yml
+  vars:
+    gitea_inventory_host: "{{ groups['gitea_group'] | first }}"
+    gitea_inventory_vars: "{{ hostvars[gitea_inventory_host] }}"
+    jenkins_inventory_host: "{{ groups['jenkins_group'] | first }}"
+    jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
+    gitea_ctid: "{{ gitea_inventory_vars.gitea_ctid }}"
+    jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    gitea_base_url: "https://{{ gitea_inventory_vars.node_domain }}"
+    gitea_service_user: "{{ jenkins_gitea_service_user }}"
+    jenkins_job_name: "{{ gitea_repo_name }}-ci"
+    # Rendered on the PVE node, then pushed into the Jenkins CT via pct.
+    jenkins_bootstrap_script_stage: "/tmp/10-{{ jenkins_job_name }}.groovy"
+    jenkins_bootstrap_script_ct: "{{ jenkins_install_dir }}/data/init.groovy.d/10-{{ jenkins_job_name }}.groovy"
+    jenkins_webhook_url: "https://{{ jenkins_inventory_vars.node_domain }}/job/{{ jenkins_job_name }}/build?token={{ jenkins_job_token }}"
+  pre_tasks:
+    - name: Validate repository settings
+      assert:
+        that:
+          - gitea_repo_owner is defined
+          - gitea_repo_owner | length > 0
+          - gitea_repo_name is defined
+          - gitea_repo_name | length > 0
+          - admin_login is defined
+          - admin_login | length > 0
+          - admin_password is defined
+          - admin_password | length > 0
+        fail_msg: >-
+          Provide gitea_repo_owner and gitea_repo_name when running this playbook,
+          and set admin_login/admin_password (Gitea site admin) in secrets.yml.
+
+    # Токен с фиксированным именем: перед генерацией удаляем прежний, чтобы в
+    # Gitea не накапливались токены (генерация с занятым именем иначе падает).
+    - name: Revoke any previous Gitea service token so they do not accumulate
+      uri:
+        url: "{{ gitea_base_url }}/api/v1/users/{{ gitea_service_user }}/tokens/{{ jenkins_gitea_credentials_id }}"
+        method: DELETE
+        url_username: "{{ admin_login }}"
+        url_password: "{{ admin_password }}"
+        force_basic_auth: true
+        status_code:
+          - 204
+          - 404
+      no_log: true
+
+    - name: Generate a Gitea service token
+      command:
+        argv:
+          - pct
+          - exec
+          - "{{ gitea_ctid }}"
+          - --
+          - docker
+          - exec
+          - -u
+          - git
+          - gitea
+          - gitea
+          - admin
+          - user
+          - generate-access-token
+          - --username
+          - "{{ gitea_service_user }}"
+          - --token-name
+          - "{{ jenkins_gitea_credentials_id }}"
+          - --scopes
+          - all
+          - --raw
+      register: gitea_service_token_result
+      changed_when: true
+      no_log: true
+
+    - name: Set the Gitea service token fact
+      set_fact:
+        gitea_service_token: "{{ gitea_service_token_result.stdout | trim }}"
+      no_log: true
+
+    - name: Generate a fresh Jenkins job token
+      command: openssl rand -hex 16
+      register: jenkins_job_token_result
+      changed_when: true
+      no_log: true
+
+    - name: Set the Jenkins job token fact
+      set_fact:
+        jenkins_job_token: "{{ jenkins_job_token_result.stdout | trim }}"
+      no_log: true
+
+    # template нельзя гонять через pct exec, поэтому рендерим скрипт на самой
+    # PVE-ноде, а затем заливаем его внутрь Jenkins CT через `pct push`.
+    - name: Render the Jenkins job bootstrap script on the PVE node
+      template:
+        src: roles/jenkins/templates/init.groovy.d/10-gitea-repo-hook.groovy.j2
+        dest: "{{ jenkins_bootstrap_script_stage }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Ensure the Jenkins init script directory exists inside the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        mkdir -p {{ jenkins_install_dir }}/data/init.groovy.d
+      changed_when: false
+
+    - name: Push the job bootstrap script into the Jenkins CT
+      command: >-
+        pct push {{ jenkins_ctid }}
+        {{ jenkins_bootstrap_script_stage }}
+        {{ jenkins_bootstrap_script_ct }}
+        --perms 0644
+
+    - name: Remove the staged bootstrap script from the PVE node
+      file:
+        path: "{{ jenkins_bootstrap_script_stage }}"
+        state: absent
+
+    - name: Restart Jenkins so the job bootstrap is applied
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        bash -lc 'cd {{ jenkins_install_dir }} && docker compose restart jenkins'
+
+    - name: Wait for Jenkins HTTP to come back
+      wait_for:
+        host: "{{ jenkins_inventory_vars.jenkins_ct_ip }}"
+        port: "{{ jenkins_http_port }}"
+        timeout: 300
+
+    - name: Remove the one-time Jenkins bootstrap script from the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        rm -f {{ jenkins_bootstrap_script_ct }}
+      changed_when: true
+
+  tasks:
+    - name: Load existing hooks for the repository
+      uri:
+        url: "{{ gitea_base_url }}/api/v1/repos/{{ gitea_repo_owner }}/{{ gitea_repo_name }}/hooks"
+        method: GET
+        headers:
+          Authorization: "token {{ gitea_service_token }}"
+        return_content: true
+        status_code: 200
+      register: gitea_repo_hooks
+      no_log: true
+
+    - name: Assume the Jenkins hook is missing
+      set_fact:
+        gitea_jenkins_hook_exists: false
+
+    - name: Detect an existing Jenkins hook
+      set_fact:
+        gitea_jenkins_hook_exists: true
+      when: item.config.url == jenkins_webhook_url
+      loop: "{{ gitea_repo_hooks.json | default([]) }}"
+
+    - name: Create the Jenkins webhook on the repository
+      uri:
+        url: "{{ gitea_base_url }}/api/v1/repos/{{ gitea_repo_owner }}/{{ gitea_repo_name }}/hooks"
+        method: POST
+        headers:
+          Authorization: "token {{ gitea_service_token }}"
+        body_format: json
+        body:
+          type: gitea
+          active: true
+          config:
+            content_type: json
+            url: "{{ jenkins_webhook_url }}"
+          events:
+            - push
+        status_code:
+          - 200
+          - 201
+      when: not gitea_jenkins_hook_exists
+      no_log: true

@@ -1,0 +1,87 @@
+---
+- name: Connect Harbor robot account to Jenkins
+  hosts: "{{ jenkins_pve_target | default('pve1') }}"
+  become: yes
+  gather_facts: false
+  vars_files:
+    - secrets.yml
+  vars:
+    jenkins_inventory_host: "{{ groups['jenkins_group'] | first }}"
+    jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
+    jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    jenkins_credentials_file: "{{ jenkins_install_dir }}/data/credentials.xml"
+    # Rendered on the PVE node, then pushed into the Jenkins CT via pct.
+    harbor_credential_script_stage: "/tmp/20-harbor-auth.groovy"
+    harbor_credential_script_ct: "{{ jenkins_install_dir }}/data/init.groovy.d/20-harbor-auth.groovy"
+  pre_tasks:
+    - name: Validate Harbor robot credentials settings
+      assert:
+        that:
+          - jenkins_harbor_credentials_id is defined
+          - jenkins_harbor_credentials_id | length > 0
+          - jenkins_harbor_service_user is defined
+          - jenkins_harbor_service_user | length > 0
+          - jenkins_harbor_service_token is defined
+          - jenkins_harbor_service_token | length > 0
+        fail_msg: >-
+          Set jenkins_harbor_credentials_id, jenkins_harbor_service_user,
+          and jenkins_harbor_service_token before running this playbook.
+
+    - name: Ensure the Jenkins init script directory exists inside the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        mkdir -p {{ jenkins_install_dir }}/data/init.groovy.d
+      changed_when: false
+
+    - name: Render the Harbor credential bootstrap script on the PVE node
+      template:
+        src: roles/jenkins/templates/init.groovy.d/20-harbor-auth.groovy.j2
+        dest: "{{ harbor_credential_script_stage }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Push the Harbor credential bootstrap script into the Jenkins CT
+      command: >-
+        pct push {{ jenkins_ctid }}
+        {{ harbor_credential_script_stage }}
+        {{ harbor_credential_script_ct }}
+        --perms 0644
+
+    - name: Remove the staged Harbor bootstrap script from the PVE node
+      file:
+        path: "{{ harbor_credential_script_stage }}"
+        state: absent
+
+    - name: Restart Jenkins so the Harbor credential bootstrap is applied
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        bash -lc 'cd {{ jenkins_install_dir }} && docker compose restart jenkins'
+
+    - name: Wait for Jenkins HTTP to come back
+      wait_for:
+        host: "{{ jenkins_inventory_vars.jenkins_ct_ip }}"
+        port: "{{ jenkins_http_port }}"
+        timeout: 300
+
+    - name: Wait for the Harbor credential to appear in Jenkins
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        grep -q "<id>{{ jenkins_harbor_credentials_id }}</id>" {{ jenkins_credentials_file }}
+      register: harbor_credential_ready
+      retries: 30
+      delay: 2
+      until: harbor_credential_ready.rc == 0
+      changed_when: false
+
+    - name: Remove the one-time Harbor credential bootstrap script from the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        rm -f {{ harbor_credential_script_ct }}
+      changed_when: true
+
+  tasks:
+    - name: Confirm the Harbor credential exists in Jenkins
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        grep -q "<id>{{ jenkins_harbor_credentials_id }}</id>" {{ jenkins_credentials_file }}
+      changed_when: false
