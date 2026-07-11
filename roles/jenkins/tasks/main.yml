@@ -46,6 +46,30 @@
     group: "root"
     recurse: yes
 
+- name: Ensure Jenkins init scripts directory exists
+  file:
+    path: "{{ jenkins_install_dir }}/data/init.groovy.d"
+    state: directory
+    owner: "root"
+    group: "root"
+    mode: "0755"
+
+- name: Render built-in node executor bootstrap
+  template:
+    src: init.groovy.d/00-disable-built-in-node.groovy.j2
+    dest: "{{ jenkins_install_dir }}/data/init.groovy.d/00-disable-built-in-node.groovy"
+    owner: "root"
+    group: "root"
+    mode: "0644"
+  notify: Restart Jenkins
+
+- name: Render Jenkins Dockerfile
+  template:
+    src: Dockerfile.j2
+    dest: "{{ jenkins_install_dir }}/Dockerfile"
+    mode: "0644"
+  notify: Restart Jenkins
+
 - name: Copy Docker Compose template
   template:
     src: compose.yml.j2
@@ -54,7 +78,7 @@
   notify: Restart Jenkins
 
 - name: Start Jenkins via Docker Compose
-  command: docker compose up -d
+  command: docker compose up -d --build
   args:
     chdir: "{{ jenkins_install_dir }}"
   register: docker_output

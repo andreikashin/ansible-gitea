@@ -1,0 +1,12 @@
+import jenkins.model.Jenkins
+
+def jenkins = Jenkins.instance
+def desiredExecutors = 0
+
+if (jenkins.numExecutors != desiredExecutors) {
+    println("Disabling executors on the built-in node: ${jenkins.numExecutors} -> ${desiredExecutors}")
+    jenkins.setNumExecutors(desiredExecutors)
+    jenkins.save()
+} else {
+    println("Built-in node executors already set to ${desiredExecutors}")
+}

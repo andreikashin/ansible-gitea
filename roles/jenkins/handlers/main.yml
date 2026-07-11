@@ -1,5 +1,5 @@
 ---
 - name: Restart Jenkins
-  command: docker compose up -d --force-recreate
+  command: docker compose up -d --build --force-recreate
   args:
     chdir: "{{ jenkins_install_dir }}"

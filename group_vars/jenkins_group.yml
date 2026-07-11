@@ -9,4 +9,19 @@ jenkins_csp_policy: "sandbox allow-scripts; default-src 'none'; img-src 'self' d
 jenkins_java_opts: >-
   -Djenkins.install.runSetupWizard=false
 
+jenkins_image_name: local/jenkins-git:lts-jdk21
+jenkins_gitea_service_user: jenkins
+jenkins_gitea_credentials_id: gitea-auth
+jenkins_gitea_repo_branch: main
+jenkins_harbor_service_user: robot$global-jenkins
+jenkins_harbor_credentials_id: harbor-auth
+jenkins_harbor_credentials_description: Harbor credentials for Jenkins robot access
+
+jenkins_ip_rotation_release_keystore_credentials_id: ip-rotation-release-keystore
+jenkins_ip_rotation_release_keystore_credentials_description: IP Rotation release keystore for Android signing
+jenkins_ip_rotation_release_store_password_credentials_id: ip-rotation-release-store-password
+jenkins_ip_rotation_release_store_password_credentials_description: IP Rotation release keystore password
+jenkins_ip_rotation_release_key_alias_credentials_id: ip-rotation-release-key-alias
+jenkins_ip_rotation_release_key_alias_credentials_description: IP Rotation release keystore key alias
+
 #  -Dhudson.model.DirectoryBrowserSupport.CSP="{{ jenkins_csp_policy }}"
