@@ -46,7 +46,7 @@
         - control_rsync_check.rc == 0
         - control_rsync_version is version('3.1', '<')
 
-- name: Back up Proxmox VE virtual machines
+- name: Back up Proxmox VE virtual guests
   hosts: "{{ proxmox_target | default('pve_group') }}"
   vars:
     proxmox_ssh_user: "{{ ansible_user | default('root') }}"
@@ -110,14 +110,24 @@
       register: proxmox_cluster_resources
       changed_when: false
 
-    # Берём VMID из cluster resources API и фильтруем только QEMU ВМ текущего узла.
-    - name: Extract VMIDs from cluster resources
+    # Берём гостей из cluster resources API и фильтруем только QEMU/LXC текущего узла.
+    - name: Extract guests from cluster resources
       set_fact:
-        proxmox_discovered_vm_ids: >-
+        proxmox_discovered_guests: >-
           {{
             (proxmox_cluster_resources.stdout | default('[]') | from_json)
             | selectattr('node', 'equalto', proxmox_node_name)
-            | selectattr('type', 'equalto', 'qemu')
+            | selectattr('type', 'in', ['qemu', 'lxc'])
+            | sort(attribute='vmid')
+            | list
+          }}
+      changed_when: false
+
+    - name: Extract guest IDs from cluster resources
+      set_fact:
+        proxmox_discovered_vm_ids: >-
+          {{
+            proxmox_discovered_guests
             | map(attribute='vmid')
             | map('int')
             | sort
@@ -138,13 +148,25 @@
           }}
       changed_when: false
 
-    - name: Build VMID list for this host
+    - name: Build guest list for this host
+      set_fact:
+        proxmox_guests: >-
+          {{
+            proxmox_discovered_guests
+            if proxmox_requested_vm_ids | length == 0
+            else (proxmox_discovered_guests | selectattr('vmid', 'in', proxmox_requested_vm_ids) | list)
+          }}
+      changed_when: false
+
+    - name: Build guest ID list for this host
       set_fact:
         proxmox_vm_ids: >-
           {{
-            proxmox_discovered_vm_ids
-            if proxmox_requested_vm_ids | length == 0
-            else proxmox_requested_vm_ids
+            proxmox_guests
+            | map(attribute='vmid')
+            | map('int')
+            | sort
+            | list
           }}
       changed_when: false
 
@@ -158,13 +180,13 @@
       debug:
         msg: >-
           Proxmox node name resolved to '{{ proxmox_node_name }}'.
-          Discovered VMIDs on {{ inventory_hostname }}: {{
+          Discovered guest IDs on {{ inventory_hostname }}: {{
             proxmox_discovered_vm_ids | join(', ') if proxmox_discovered_vm_ids | length > 0 else 'none'
           }}.
-          Requested VMIDs: {{
+          Requested guest IDs: {{
             proxmox_requested_vm_ids | join(', ') if proxmox_requested_vm_ids | length > 0 else 'none'
           }}.
-          Missing requested VMIDs: {{
+          Missing requested guest IDs: {{
             proxmox_missing_requested_vm_ids | join(', ') if proxmox_missing_requested_vm_ids | length > 0 else 'none'
           }}.
       changed_when: false
@@ -172,7 +194,7 @@
     - name: Fail if requested VMIDs are missing
       fail:
         msg: >-
-          Requested VMIDs were not found on {{ inventory_hostname }}: {{
+          Requested guest IDs were not found on {{ inventory_hostname }}: {{
             proxmox_missing_requested_vm_ids | join(', ')
           }}.
       when:
@@ -194,11 +216,11 @@
         proxmox_copied_config_files: []
       changed_when: false
 
-    - name: Note when no VMs exist
+    - name: Note when no guests exist
       debug:
         msg: >-
-          No VMs were found on {{ inventory_hostname }}.
-          VM backup loop will be skipped, but configuration files will still be copied.
+          No guests were found on {{ inventory_hostname }}.
+          Guest backup loop will be skipped, but configuration files will still be copied.
       when: proxmox_vm_ids | length == 0
       changed_when: false
 
@@ -225,12 +247,12 @@
     # 2) `include_tasks` обрабатывает одну VM за итерацию: сначала vzdump,
     #    потом копирование на локальный путь, затем удаление архива с PVE.
     # `async` + `poll` нужны, чтобы долгий vzdump не обрывал выполнение Ansible.
-    - name: Back up, copy and clean each VM sequentially
+    - name: Back up, copy and clean each guest sequentially
       include_tasks: backup_proxmox_vm_item.yml
-      loop: "{{ proxmox_vm_ids }}"
+      loop: "{{ proxmox_guests }}"
       loop_control:
-        loop_var: proxmox_vm_id
-        label: "VMID {{ proxmox_vm_id }}"
+        loop_var: proxmox_guest
+        label: "{{ proxmox_guest.type | upper }} {{ proxmox_guest.vmid }}"
 
   post_tasks:
     # Когда все VM-архивы уже лежат в локальной папке узла,
@@ -247,11 +269,11 @@
         msg: >-
           Backup finished on {{ inventory_hostname }}.
           Local artifacts are in {{ proxmox_backup_host_dir }}.
-          Successful VMIDs: {{
+          Successful guest IDs: {{
             (proxmox_vm_ids | reject('in', proxmox_failed_vmids) | list) | join(', ')
             if proxmox_vm_ids | length > 0 else 'none'
           }}.
-          Failed VMIDs: {{
+          Failed guest IDs: {{
             proxmox_failed_vmids | join(', ')
             if proxmox_failed_vmids | length > 0 else 'none'
           }}.

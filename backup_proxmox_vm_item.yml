@@ -1,7 +1,19 @@
 ---
-- name: Backup, copy and clean a single VM
+- name: Backup, copy and clean a single guest
   block:
-    - name: Run vzdump for VM
+    - name: Set per-guest facts
+      set_fact:
+        proxmox_vm_id: "{{ proxmox_guest.vmid | int }}"
+        proxmox_guest_type: "{{ proxmox_guest.type }}"
+        proxmox_backup_archive_pattern: >-
+          {{
+            'vzdump-qemu-' ~ proxmox_guest.vmid ~ '-*.vma.zst'
+            if proxmox_guest.type == 'qemu'
+            else 'vzdump-lxc-' ~ proxmox_guest.vmid ~ '-*.tar.zst'
+          }}
+      changed_when: false
+
+    - name: Run vzdump for guest
       command:
         argv:
           - vzdump
@@ -16,12 +28,12 @@
       poll: "{{ proxmox_backup_poll_interval | int }}"
       register: proxmox_vzdump_result
 
-    # После завершения vzdump ищем именно созданный архив VM на PVE.
-    # Выбираем самый свежий файл для данной VMID, потому что имя содержит timestamp.
-    - name: Find backup archive for this VM
+    # После завершения vzdump ищем именно созданный архив гостя на PVE.
+    # Выбираем самый свежий файл для данной guest ID, потому что имя содержит timestamp.
+    - name: Find backup archive for this guest
       find:
         paths: "{{ proxmox_backup_remote_dir }}"
-        patterns: "vzdump-qemu-{{ proxmox_vm_id }}-*.vma.zst"
+        patterns: "{{ proxmox_backup_archive_pattern }}"
         file_type: file
       register: proxmox_vzdump_archives
       changed_when: false
@@ -29,7 +41,7 @@
     - name: Fail if no archive was created
       fail:
         msg: >-
-          No backup archive was found for VMID {{ proxmox_vm_id }} in {{ proxmox_backup_remote_dir }}.
+          No backup archive was found for guest {{ proxmox_guest_type | upper }} {{ proxmox_vm_id }} in {{ proxmox_backup_remote_dir }}.
       when: proxmox_vzdump_archives.matched | int == 0
 
     - name: Select newest archive path
@@ -133,7 +145,7 @@
     - name: Warn if remote cleanup failed
       debug:
         msg: >-
-          Backup for VMID {{ proxmox_vm_id }} was copied to {{ proxmox_backup_host_dir }},
+          Backup for guest {{ proxmox_guest_type | upper }} {{ proxmox_vm_id }} was copied to {{ proxmox_backup_host_dir }},
           but the source file could not be removed from {{ proxmox_backup_remote_dir }}.
       when:
         - proxmox_rsync_result.rc | default(1) | int == 0
@@ -156,12 +168,12 @@
       failed_when: false
       when: proxmox_rsync_log_file is defined
 
-    - name: Report VM backup failure
+    - name: Report guest backup failure
       debug:
         msg: >-
-          Backup flow failed for VMID {{ proxmox_vm_id }} on {{ inventory_hostname }}.
+          Backup flow failed for guest {{ proxmox_guest_type | upper }} {{ proxmox_vm_id }} on {{ inventory_hostname }}.
           vzdump rc: {{ proxmox_vzdump_result.rc if proxmox_vzdump_result is defined else 'n/a' }}.
           rsync rc: {{ proxmox_rsync_result.rc if proxmox_rsync_result is defined else 'n/a' }}.
           rsync log tail: {{ proxmox_rsync_log_tail.stdout | default('n/a') | trim | default('n/a', true) if proxmox_rsync_log_tail is defined else 'n/a' }}.
-          Moving on to the next VM.
+          Moving on to the next guest.
       changed_when: false
