@@ -1,4 +1,23 @@
 ---
+- name: Install system dependencies
+  apt:
+    name:
+      - curl
+      - ca-certificates
+    state: present
+    update_cache: yes
+
+- name: Install Docker
+  shell: "curl -fsSL https://get.docker.com | sh"
+  args:
+    creates: /usr/bin/docker
+
+- name: Ensure Docker service is running
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
 # --- 1. INSTALL DOCKER COMPOSE (MANUAL) ---
 - name: Create directory for Docker CLI plugins
   file:

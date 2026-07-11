@@ -1,5 +1,22 @@
+---
 - name: Deploy Gitea
   hosts: gitea_group
   become: yes
+  gather_facts: false
+  pre_tasks:
+    - name: Remove stale Gitea host key from controller known_hosts
+      known_hosts:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/known_hosts"
+        name: "{{ item }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      loop:
+        - "{{ gitea_ct_ip }}"
+        - "{{ node_domain }}"
+
+    - name: Wait for SSH on Gitea host
+      wait_for_connection:
+        timeout: 300
   roles:
     - gitea

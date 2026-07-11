@@ -1,5 +1,22 @@
 ---
-- hosts: jenkins_group
-  become: true
+- name: Deploy Jenkins
+  hosts: jenkins_group
+  become: yes
+  gather_facts: false
+  pre_tasks:
+    - name: Remove stale Jenkins host key from controller known_hosts
+      known_hosts:
+        path: "{{ lookup('env', 'HOME') }}/.ssh/known_hosts"
+        name: "{{ item }}"
+        state: absent
+      delegate_to: localhost
+      become: false
+      loop:
+        - "{{ jenkins_ct_ip }}"
+        - "{{ node_domain }}"
+
+    - name: Wait for SSH on Jenkins host
+      wait_for_connection:
+        timeout: 300
   roles:
     - jenkins

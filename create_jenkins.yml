@@ -1,0 +1,123 @@
+---
+- name: Provision Jenkins container on Proxmox
+  hosts: "{{ jenkins_pve_target | default('pve1') }}"
+  become: yes
+  gather_facts: false
+  vars:
+    jenkins_inventory_host: "{{ groups['jenkins_group'] | first }}"
+    jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
+    jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    jenkins_ct_hostname: "{{ jenkins_inventory_vars.jenkins_ct_hostname }}"
+    jenkins_ct_template_storage: "{{ jenkins_inventory_vars.jenkins_ct_template_storage }}"
+    jenkins_ct_template_name: "{{ jenkins_inventory_vars.jenkins_ct_template_name }}"
+    jenkins_ct_template_cache_path: "/var/lib/vz/template/cache/{{ jenkins_ct_template_name }}"
+    jenkins_ct_ostemplate: "{{ jenkins_ct_template_storage }}:vztmpl/{{ jenkins_ct_template_name }}"
+    jenkins_ct_rootfs: "{{ jenkins_inventory_vars.jenkins_ct_rootfs }}"
+    jenkins_ct_cores: "{{ jenkins_inventory_vars.jenkins_ct_cores }}"
+    jenkins_ct_memory: "{{ jenkins_inventory_vars.jenkins_ct_memory }}"
+    jenkins_ct_swap: "{{ jenkins_inventory_vars.jenkins_ct_swap }}"
+    jenkins_ct_net0: "{{ jenkins_inventory_vars.jenkins_ct_net0 }}"
+    jenkins_ct_ip: "{{ jenkins_inventory_vars.jenkins_ct_ip }}"
+    jenkins_ct_nameserver: "{{ jenkins_inventory_vars.jenkins_ct_nameserver }}"
+    jenkins_ct_features: "{{ jenkins_inventory_vars.jenkins_ct_features }}"
+    jenkins_bootstrap_ssh_pubkey: "{{ lookup('env', 'JENKINS_BOOTSTRAP_SSH_PUBKEY') | default('', true) }}"
+    jenkins_bootstrap_packages: "openssh-server python3 sudo ca-certificates curl"
+  pre_tasks:
+    - name: Validate Jenkins CT settings
+      assert:
+        that:
+          - jenkins_ctid is defined
+          - jenkins_ct_rootfs is defined
+          - jenkins_ct_net0 is defined
+          - jenkins_bootstrap_ssh_pubkey is defined
+          - jenkins_bootstrap_ssh_pubkey | length > 0
+        fail_msg: >-
+          Set jenkins_ctid, jenkins_ct_rootfs and jenkins_ct_net0 in host_vars/jenkins_node.yml,
+          and supply jenkins_bootstrap_ssh_pubkey externally (for example via
+          JENKINS_BOOTSTRAP_SSH_PUBKEY or -e jenkins_bootstrap_ssh_pubkey=...).
+
+    - name: Download Jenkins LXC template if missing
+      command: >-
+        pveam download {{ jenkins_ct_template_storage | default('local') }}
+        {{ jenkins_ct_template_name | default('debian-12-standard_12.12-1_amd64.tar.zst') }}
+      args:
+        creates: "{{ jenkins_ct_template_cache_path }}"
+      register: jenkins_template_download
+      changed_when: jenkins_template_download.rc == 0
+
+    - name: Ensure /root/.ssh exists on the PVE node
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: '0700'
+
+    - name: Write temporary SSH public key for the new CT
+      copy:
+        dest: "/root/.ssh/jenkins-{{ jenkins_ctid }}.pub"
+        content: "{{ jenkins_bootstrap_ssh_pubkey }}\n"
+        mode: '0600'
+
+    - name: Check whether Jenkins CT already exists
+      command: pct config {{ jenkins_ctid }}
+      register: jenkins_ct_config
+      changed_when: false
+      failed_when: false
+
+    - name: Create Jenkins CT if missing
+      command:
+        argv:
+          - pct
+          - create
+          - "{{ jenkins_ctid }}"
+          - "{{ jenkins_ct_ostemplate }}"
+          - --hostname
+          - "{{ jenkins_ct_hostname | default('jenkins') }}"
+          - --rootfs
+          - "{{ jenkins_ct_rootfs }}"
+          - --cores
+          - "{{ jenkins_ct_cores | default(2) }}"
+          - --memory
+          - "{{ jenkins_ct_memory | default(2048) }}"
+          - --swap
+          - "{{ jenkins_ct_swap | default(512) }}"
+          - --net0
+          - "{{ jenkins_ct_net0 }}"
+          - --nameserver
+          - "{{ jenkins_ct_nameserver | default('192.168.1.1') }}"
+          - --features
+          - "{{ jenkins_ct_features | default('nesting=1,keyctl=1') }}"
+          - --onboot
+          - "1"
+          - --ssh-public-keys
+          - "/root/.ssh/jenkins-{{ jenkins_ctid }}.pub"
+      when: jenkins_ct_config.rc != 0
+      register: jenkins_ct_create
+
+    - name: Start Jenkins CT
+      command: pct start {{ jenkins_ctid }}
+      changed_when: false
+      failed_when: false
+
+    - name: Bootstrap SSH and base packages inside the CT
+      command:
+        argv:
+          - pct
+          - exec
+          - "{{ jenkins_ctid }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export DEBIAN_FRONTEND=noninteractive;
+            if ! command -v sshd >/dev/null 2>&1; then
+              apt-get update && apt-get install -y {{ jenkins_bootstrap_packages }};
+            fi;
+            systemctl enable ssh;
+            systemctl restart ssh;
+      changed_when: false
+
+    - name: Wait for SSH on the new Jenkins CT
+      wait_for:
+        host: "{{ jenkins_ct_ip }}"
+        port: 22
+        timeout: 300

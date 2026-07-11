@@ -1,0 +1,123 @@
+---
+- name: Provision Gitea container on Proxmox
+  hosts: "{{ gitea_pve_target | default('pve1') }}"
+  become: yes
+  gather_facts: false
+  vars:
+    gitea_inventory_host: "{{ groups['gitea_group'] | first }}"
+    gitea_inventory_vars: "{{ hostvars[gitea_inventory_host] }}"
+    gitea_ctid: "{{ gitea_inventory_vars.gitea_ctid }}"
+    gitea_ct_hostname: "{{ gitea_inventory_vars.gitea_ct_hostname }}"
+    gitea_ct_template_storage: "{{ gitea_inventory_vars.gitea_ct_template_storage }}"
+    gitea_ct_template_name: "{{ gitea_inventory_vars.gitea_ct_template_name }}"
+    gitea_ct_template_cache_path: "/var/lib/vz/template/cache/{{ gitea_ct_template_name }}"
+    gitea_ct_ostemplate: "{{ gitea_ct_template_storage }}:vztmpl/{{ gitea_ct_template_name }}"
+    gitea_ct_rootfs: "{{ gitea_inventory_vars.gitea_ct_rootfs }}"
+    gitea_ct_cores: "{{ gitea_inventory_vars.gitea_ct_cores }}"
+    gitea_ct_memory: "{{ gitea_inventory_vars.gitea_ct_memory }}"
+    gitea_ct_swap: "{{ gitea_inventory_vars.gitea_ct_swap }}"
+    gitea_ct_net0: "{{ gitea_inventory_vars.gitea_ct_net0 }}"
+    gitea_ct_ip: "{{ gitea_inventory_vars.gitea_ct_ip }}"
+    gitea_ct_nameserver: "{{ gitea_inventory_vars.gitea_ct_nameserver }}"
+    gitea_ct_features: "{{ gitea_inventory_vars.gitea_ct_features }}"
+    gitea_bootstrap_ssh_pubkey: "{{ lookup('env', 'GITEA_BOOTSTRAP_SSH_PUBKEY') | default('', true) }}"
+    gitea_bootstrap_packages: "openssh-server python3 sudo ca-certificates curl"
+  pre_tasks:
+    - name: Validate Gitea CT settings
+      assert:
+        that:
+          - gitea_ctid is defined
+          - gitea_ct_rootfs is defined
+          - gitea_ct_net0 is defined
+          - gitea_bootstrap_ssh_pubkey is defined
+          - gitea_bootstrap_ssh_pubkey | length > 0
+        fail_msg: >-
+          Set gitea_ctid, gitea_ct_rootfs and gitea_ct_net0 in host_vars/gitea_node.yml,
+          and supply gitea_bootstrap_ssh_pubkey externally (for example via
+          GITEA_BOOTSTRAP_SSH_PUBKEY or -e gitea_bootstrap_ssh_pubkey=...).
+
+    - name: Download Gitea LXC template if missing
+      command: >-
+        pveam download {{ gitea_ct_template_storage | default('local') }}
+        {{ gitea_ct_template_name | default('debian-12-standard_12.12-1_amd64.tar.zst') }}
+      args:
+        creates: "{{ gitea_ct_template_cache_path }}"
+      register: gitea_template_download
+      changed_when: gitea_template_download.rc == 0
+
+    - name: Ensure /root/.ssh exists on the PVE node
+      file:
+        path: /root/.ssh
+        state: directory
+        mode: '0700'
+
+    - name: Write temporary SSH public key for the new CT
+      copy:
+        dest: "/root/.ssh/gitea-{{ gitea_ctid }}.pub"
+        content: "{{ gitea_bootstrap_ssh_pubkey }}\n"
+        mode: '0600'
+
+    - name: Check whether Gitea CT already exists
+      command: pct config {{ gitea_ctid }}
+      register: gitea_ct_config
+      changed_when: false
+      failed_when: false
+
+    - name: Create Gitea CT if missing
+      command:
+        argv:
+          - pct
+          - create
+          - "{{ gitea_ctid }}"
+          - "{{ gitea_ct_ostemplate }}"
+          - --hostname
+          - "{{ gitea_ct_hostname | default('gitea') }}"
+          - --rootfs
+          - "{{ gitea_ct_rootfs }}"
+          - --cores
+          - "{{ gitea_ct_cores | default(2) }}"
+          - --memory
+          - "{{ gitea_ct_memory | default(2048) }}"
+          - --swap
+          - "{{ gitea_ct_swap | default(512) }}"
+          - --net0
+          - "{{ gitea_ct_net0 }}"
+          - --nameserver
+          - "{{ gitea_ct_nameserver | default('192.168.1.1') }}"
+          - --features
+          - "{{ gitea_ct_features | default('nesting=1,keyctl=1') }}"
+          - --onboot
+          - "1"
+          - --ssh-public-keys
+          - "/root/.ssh/gitea-{{ gitea_ctid }}.pub"
+      when: gitea_ct_config.rc != 0
+      register: gitea_ct_create
+
+    - name: Start Gitea CT
+      command: pct start {{ gitea_ctid }}
+      changed_when: false
+      failed_when: false
+
+    - name: Bootstrap SSH and base packages inside the CT
+      command:
+        argv:
+          - pct
+          - exec
+          - "{{ gitea_ctid }}"
+          - --
+          - bash
+          - -lc
+          - >-
+            export DEBIAN_FRONTEND=noninteractive;
+            if ! command -v sshd >/dev/null 2>&1; then
+              apt-get update && apt-get install -y {{ gitea_bootstrap_packages }};
+            fi;
+            systemctl enable ssh;
+            systemctl restart ssh;
+      changed_when: false
+
+    - name: Wait for SSH on the new Gitea CT
+      wait_for:
+        host: "{{ gitea_ct_ip }}"
+        port: 22
+        timeout: 300
