@@ -4,7 +4,8 @@ hostname: {{ harbor_hostname }}
 http:
   port: {{ harbor_port_http }}
 
-# HTTPS disabled (SSL handled by NPM)
+# HTTPS is terminated by Traefik at the edge.
+# Harbor itself stays on HTTP and must advertise the public Traefik hostname.
 # https:
 #   port: 443
 #   certificate: /your/certificate/path
@@ -23,8 +24,9 @@ database:
 jobservice:
   max_job_workers: 10
   job_loggers:
-    - file
-    - database
+    - STD_OUTPUT
+    - FILE
+    - DB
   logger_sweeper_duration: 14
 
 notification:
