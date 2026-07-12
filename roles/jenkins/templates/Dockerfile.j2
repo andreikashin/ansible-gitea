@@ -6,6 +6,6 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN jenkins-plugin-cli --plugins workflow-aggregator credentials-binding job-dsl workflow-multibranch git pipeline-model-definition docker-workflow timestamper ws-cleanup
+RUN jenkins-plugin-cli --plugins workflow-aggregator credentials-binding job-dsl workflow-multibranch git pipeline-model-definition docker-workflow timestamper ws-cleanup blueocean
 
 USER jenkins
