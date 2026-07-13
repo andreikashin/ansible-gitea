@@ -1,0 +1,3 @@
+# Shell scripts must keep LF endings — they run on Linux (agents/CTs), and a
+# CRLF shebang (`#!/usr/bin/env bash\r`) breaks execution.
+*.sh text eol=lf
