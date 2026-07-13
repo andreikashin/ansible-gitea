@@ -1,0 +1,72 @@
+---
+# Idempotently place a file inside the guest VM through the qemu guest agent.
+# No SSH into the guest is needed: we run `qm guest exec` on the pve host and
+# stream the content via --pass-stdin into `tee`.
+#
+# Expected vars:
+#   gf_dest        - absolute path inside the guest
+#   gf_content     - desired file content (string)
+#   gf_mode        - octal mode (default "0644")
+#   gf_changed_var - name of a fact to set true when the file was (re)written
+
+- name: "guest_file | read current {{ gf_dest }}"
+  ansible.builtin.command:
+    argv:
+      - qm
+      - guest
+      - exec
+      - "{{ jenkins_agent_vmid }}"
+      - "--"
+      - /bin/cat
+      - "{{ gf_dest }}"
+  register: gf_read
+  changed_when: false
+  failed_when: false
+
+- name: "guest_file | decode current {{ gf_dest }}"
+  ansible.builtin.set_fact:
+    gf_current: "{{ (gf_read.stdout | from_json)['out-data'] | default('') }}"
+
+- name: "guest_file | write {{ gf_dest }}"
+  # Content is base64-encoded here and decoded on the guest. b64encode forces
+  # Jinja to render gf_content to a concrete string; passing the raw value
+  # straight to `stdin` makes the command module serialize a dict as its Python
+  # repr (single quotes, True) instead of JSON, which breaks daemon.json.
+  ansible.builtin.command:
+    argv:
+      - qm
+      - guest
+      - exec
+      - "{{ jenkins_agent_vmid }}"
+      - "--pass-stdin"
+      - "1"
+      - "--timeout"
+      - "60"
+      - "--"
+      - /bin/bash
+      - "-c"
+      - "base64 -d > '{{ gf_dest }}'"
+    stdin: "{{ gf_content | b64encode }}"
+  register: gf_write
+  when: gf_current != gf_content
+  changed_when: true
+  failed_when: gf_write.rc != 0 or (gf_write.stdout | from_json).exitcode | default(1) != 0
+
+- name: "guest_file | chmod {{ gf_dest }}"
+  ansible.builtin.command:
+    argv:
+      - qm
+      - guest
+      - exec
+      - "{{ jenkins_agent_vmid }}"
+      - "--"
+      - /bin/chmod
+      - "{{ gf_mode | default('0644') }}"
+      - "{{ gf_dest }}"
+  when: gf_current != gf_content
+  changed_when: false
+
+- name: "guest_file | flag change for {{ gf_dest }}"
+  ansible.builtin.set_fact:
+    "{{ gf_changed_var }}": true
+  when: gf_current != gf_content

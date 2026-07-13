@@ -1,0 +1,14 @@
+---
+# Configure the Jenkins build agent's Docker GC.
+#
+# The agent is VM 310 on pve1, created out of band and not reachable with our
+# SSH key, so the play targets the pve *host* and drives the guest through the
+# qemu guest agent (`qm guest exec`). Override the target with -e or a var if
+# the agent ever moves to another node.
+- name: Configure Jenkins build agent (Docker GC) via the pve guest agent
+  hosts: "{{ jenkins_agent_pve_target | default('pve1') }}"
+  become: true
+  gather_facts: false
+
+  roles:
+    - jenkins_agent

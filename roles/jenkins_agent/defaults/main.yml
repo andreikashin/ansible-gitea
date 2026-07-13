@@ -1,0 +1,31 @@
+---
+# The agent VM's id on the pve host; all guest ops go through `qm guest exec`.
+jenkins_agent_vmid: 310
+
+# Paths for the GC units/script on the agent.
+jenkins_agent_gc_script: /usr/local/bin/docker-gc.sh
+jenkins_agent_gc_env_file: /etc/docker-gc.env
+
+# Buildkit build-cache upper bound (also enforced continuously via daemon.json).
+jenkins_agent_gc_build_cache_keep: "10GB"
+
+# Only remove unused images older than this many hours (avoids racing an
+# in-flight build that just built but hasn't pushed yet).
+jenkins_agent_gc_image_max_age_hours: 24
+
+# Extended-regex of image refs to NEVER auto-remove. These are pulled base
+# images that are expensive to re-download and meant to stay cached.
+jenkins_agent_gc_protect_regex: "cimg/|moby/buildkit"
+
+# When the timer fires (systemd OnCalendar). Default: nightly at 04:00.
+jenkins_agent_gc_timer_schedule: "*-*-* 04:00:00"
+
+# Set true to also run a GC pass immediately when the role is applied.
+jenkins_agent_gc_run_now: false
+
+# Merged (recursively) into /etc/docker/daemon.json; existing keys are kept.
+jenkins_agent_docker_daemon:
+  builder:
+    gc:
+      enabled: true
+      defaultKeepStorage: "{{ jenkins_agent_gc_build_cache_keep }}"

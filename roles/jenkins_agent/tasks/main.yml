@@ -1,0 +1,113 @@
+---
+# Keeps the Jenkins build agent (VM {{ jenkins_agent_vmid }} on the pve host)
+# from filling its disk with Docker images and build cache.
+#
+# The play targets the *pve host*, not the agent: the agent VM was created out
+# of band and doesn't trust our SSH key, so we drive it through the qemu guest
+# agent (`qm guest exec`) — the VM analogue of the `pct exec` pattern this repo
+# uses for LXC containers. Two mechanisms are installed:
+#   1. a buildkit GC policy in /etc/docker/daemon.json  -> bounds build cache
+#   2. a systemd timer running docker-gc.sh             -> reclaims stale images
+
+- name: Confirm the guest agent is responsive
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/true]
+  register: jenkins_agent_agent_ping
+  changed_when: false
+  failed_when: jenkins_agent_agent_ping.rc != 0
+
+# --- 1. buildkit GC via daemon.json (merged, existing keys preserved) --------
+
+- name: Read existing /etc/docker/daemon.json from guest
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/cat, /etc/docker/daemon.json]
+  register: jenkins_agent_daemon_read
+  changed_when: false
+  failed_when: false
+
+- name: Parse existing daemon config
+  ansible.builtin.set_fact:
+    jenkins_agent_daemon_existing: >-
+      {{
+        ((jenkins_agent_daemon_read.stdout | from_json)['out-data'] | from_json)
+        if ((jenkins_agent_daemon_read.stdout | from_json).exitcode | default(1)) == 0
+        else {}
+      }}
+
+- name: Compute merged daemon config
+  ansible.builtin.set_fact:
+    jenkins_agent_daemon_merged: "{{ jenkins_agent_daemon_existing | combine(jenkins_agent_docker_daemon, recursive=true) }}"
+
+- name: Write /etc/docker/daemon.json when it would change
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: /etc/docker/daemon.json
+    gf_content: "{{ jenkins_agent_daemon_merged | to_nice_json }}\n"
+    gf_mode: "0644"
+    gf_changed_var: jenkins_agent_daemon_changed
+  when: jenkins_agent_daemon_merged != jenkins_agent_daemon_existing
+
+- name: Restart docker to apply new daemon.json
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--timeout", "90", "--", /bin/systemctl, restart, docker]
+  register: jenkins_agent_docker_restart
+  changed_when: true
+  failed_when: jenkins_agent_docker_restart.rc != 0 or (jenkins_agent_docker_restart.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_daemon_changed | default(false)
+
+# --- 2. periodic image GC via systemd timer ---------------------------------
+
+- name: Install docker-gc script
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: "{{ jenkins_agent_gc_script }}"
+    gf_content: "{{ lookup('ansible.builtin.file', 'docker-gc.sh') }}\n"
+    gf_mode: "0755"
+    gf_changed_var: jenkins_agent_units_changed
+
+- name: Install docker-gc environment file
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: "{{ jenkins_agent_gc_env_file }}"
+    gf_content: "{{ lookup('ansible.builtin.template', 'docker-gc.env.j2') }}"
+    gf_mode: "0644"
+    gf_changed_var: jenkins_agent_units_changed
+
+- name: Install docker-gc systemd service
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: /etc/systemd/system/docker-gc.service
+    gf_content: "{{ lookup('ansible.builtin.template', 'docker-gc.service.j2') }}"
+    gf_mode: "0644"
+    gf_changed_var: jenkins_agent_units_changed
+
+- name: Install docker-gc systemd timer
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: /etc/systemd/system/docker-gc.timer
+    gf_content: "{{ lookup('ansible.builtin.template', 'docker-gc.timer.j2') }}"
+    gf_mode: "0644"
+    gf_changed_var: jenkins_agent_units_changed
+
+- name: Reload systemd after unit changes
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/systemctl, daemon-reload]
+  register: jenkins_agent_daemon_reload
+  changed_when: true
+  failed_when: jenkins_agent_daemon_reload.rc != 0 or (jenkins_agent_daemon_reload.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_units_changed | default(false)
+
+- name: Enable and start docker-gc timer
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/systemctl, enable, --now, docker-gc.timer]
+  register: jenkins_agent_timer_enable
+  changed_when: "'Created symlink' in ((jenkins_agent_timer_enable.stdout | from_json)['err-data'] | default('') ~ (jenkins_agent_timer_enable.stdout | from_json)['out-data'] | default(''))"
+  failed_when: jenkins_agent_timer_enable.rc != 0 or (jenkins_agent_timer_enable.stdout | from_json).exitcode | default(1) != 0
+
+- name: Run docker-gc once now (optional)
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--timeout", "300", "--", /bin/systemctl, start, docker-gc.service]
+  register: jenkins_agent_gc_now
+  changed_when: true
+  failed_when: jenkins_agent_gc_now.rc != 0 or (jenkins_agent_gc_now.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_gc_run_now | bool

@@ -1,0 +1,10 @@
+# Managed by Ansible (role: jenkins_agent).
+[Unit]
+Description=Run Docker GC for the Jenkins build agent on a schedule
+
+[Timer]
+OnCalendar={{ jenkins_agent_gc_timer_schedule }}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
