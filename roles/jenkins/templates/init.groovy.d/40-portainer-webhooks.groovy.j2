@@ -1,0 +1,31 @@
+import com.cloudbees.plugins.credentials.CredentialsScope
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider
+import com.cloudbees.plugins.credentials.domains.Domain
+import hudson.util.Secret
+import jenkins.model.Jenkins
+import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl
+
+def credentialsStore = SystemCredentialsProvider.getInstance().getStore()
+def globalDomain = Domain.global()
+
+def upsertCredential = { String credentialId, credential ->
+    def existingCredential = credentialsStore.getCredentials(globalDomain).find { it.id == credentialId }
+
+    if (existingCredential != null) {
+        credentialsStore.removeCredentials(globalDomain, existingCredential)
+    }
+
+    credentialsStore.addCredentials(globalDomain, credential)
+}
+
+{% for wh in jenkins_portainer_webhooks | default([]) if (wh.url | default('')) | length > 0 %}
+upsertCredential({{ wh.id | to_json }}, new StringCredentialsImpl(
+    CredentialsScope.GLOBAL,
+    {{ wh.id | to_json }},
+    {{ wh.description | default('Portainer redeploy webhook') | to_json }},
+    Secret.fromString({{ wh.url | to_json }})
+))
+{% endfor %}
+
+credentialsStore.save()
+Jenkins.instance.save()

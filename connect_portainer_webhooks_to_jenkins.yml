@@ -1,0 +1,96 @@
+---
+- name: Seed Portainer redeploy webhooks into Jenkins as Secret text credentials
+  hosts: "{{ jenkins_pve_target | default('pve1') }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - secrets.yml
+  vars:
+    jenkins_inventory_host: "{{ groups['jenkins_group'] | first }}"
+    jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
+    jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    # jenkins_install_dir / jenkins_http_port live in group_vars/jenkins_group.yml,
+    # which isn't in scope when this play targets the pve host — pull them from the
+    # Jenkins inventory host's vars.
+    jenkins_install_dir: "{{ jenkins_inventory_vars.jenkins_install_dir }}"
+    jenkins_http_port: "{{ jenkins_inventory_vars.jenkins_http_port }}"
+    jenkins_credentials_file: "{{ jenkins_install_dir }}/data/credentials.xml"
+    # One-time bootstrap script, pushed into the CT then removed once applied.
+    portainer_webhooks_script_ct: "{{ jenkins_install_dir }}/data/init.groovy.d/40-portainer-webhooks.groovy"
+    portainer_webhooks_script_stage_pve: "/tmp/40-portainer-webhooks.groovy"
+    # Only entries with a real url are seeded (empty ones are skipped).
+    managed_portainer_webhooks: "{{ jenkins_portainer_webhooks | default([]) | selectattr('url') | list }}"
+
+  pre_tasks:
+    - name: Fail when no Portainer webhook URL is configured
+      assert:
+        that:
+          - managed_portainer_webhooks | length > 0
+        fail_msg: >-
+          No Portainer webhook has a url set. Paste the webhook URL(s) into
+          `jenkins_portainer_webhooks[*].url` in secrets.yml, then re-run.
+
+    - name: Ensure the Jenkins init scripts directory exists inside the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        bash -lc 'mkdir -p {{ jenkins_install_dir }}/data/init.groovy.d'
+      changed_when: false
+
+    - name: Render the Portainer webhooks bootstrap script on the PVE node
+      template:
+        src: roles/jenkins/templates/init.groovy.d/40-portainer-webhooks.groovy.j2
+        dest: "{{ portainer_webhooks_script_stage_pve }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Push the Portainer webhooks bootstrap script into the Jenkins CT
+      command: >-
+        pct push {{ jenkins_ctid }}
+        {{ portainer_webhooks_script_stage_pve }}
+        {{ portainer_webhooks_script_ct }}
+        --perms 0644
+
+    - name: Remove the staged bootstrap script from the PVE node
+      file:
+        path: "{{ portainer_webhooks_script_stage_pve }}"
+        state: absent
+
+    - name: Restart Jenkins so the Portainer webhook credentials are applied
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        bash -lc 'cd {{ jenkins_install_dir }} && docker compose restart jenkins'
+
+    - name: Wait for Jenkins HTTP to come back
+      wait_for:
+        host: "{{ jenkins_inventory_vars.jenkins_ct_ip }}"
+        port: "{{ jenkins_http_port }}"
+        timeout: 300
+
+    - name: Wait for the Portainer webhook credentials to appear in Jenkins
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        grep -q "<id>{{ item.id }}</id>" {{ jenkins_credentials_file }}
+      loop: "{{ managed_portainer_webhooks }}"
+      loop_control:
+        label: "{{ item.id }}"
+      register: portainer_webhooks_ready
+      retries: 30
+      delay: 2
+      until: portainer_webhooks_ready.rc == 0
+      changed_when: false
+
+    - name: Remove the one-time Portainer webhooks bootstrap script from the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        rm -f {{ portainer_webhooks_script_ct }}
+      changed_when: true
+
+  tasks:
+    - name: Confirm the Portainer webhook credentials exist in Jenkins
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        grep -q "<id>{{ item.id }}</id>" {{ jenkins_credentials_file }}
+      loop: "{{ managed_portainer_webhooks }}"
+      loop_control:
+        label: "{{ item.id }}"
+      changed_when: false
