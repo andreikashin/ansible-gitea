@@ -1,6 +1,22 @@
 ---
-# The agent VM's id on the pve host; all guest ops go through `qm guest exec`.
-jenkins_agent_vmid: 310
+# Agent identity (jenkins_agent_vmid / _name / _workdir / _jar) is defined in the
+# gitignored host_vars/jenkins_agent.yml so these internal identifiers stay out of
+# this public repo. All guest ops go through `qm guest exec {{ jenkins_agent_vmid }}`.
+
+# --- Inbound (JNLP) build-agent service -------------------------------------
+# The agent is an inbound agent launched on the VM itself. It was started by
+# hand, so it survived neither a VM reboot nor a controller restart. Run it
+# under systemd (Restart=always) so it auto-starts on boot and reconnects.
+jenkins_agent_manage_service: true
+# Controller URL derived from the Jenkins node's (gitignored) host_vars so no
+# internal IP is hardcoded here. jenkins_ct_ip lives in host_vars/jenkins_node.yml.
+jenkins_agent_controller_url: "http://{{ hostvars[groups['jenkins_group'][0]].jenkins_ct_ip }}:{{ hostvars[groups['jenkins_group'][0]].jenkins_http_port }}/"
+jenkins_agent_java: "/usr/bin/java"
+jenkins_agent_run_user: "root"
+jenkins_agent_env_file: "/etc/jenkins-agent.env"
+# jenkins_agent_secret is set in secrets.yml (gitignored) and is required when
+# jenkins_agent_manage_service is true.
+jenkins_agent_secret: ""
 
 # Paths for the GC units/script on the agent.
 jenkins_agent_gc_script: /usr/local/bin/docker-gc.sh

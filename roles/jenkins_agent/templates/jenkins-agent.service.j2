@@ -1,0 +1,17 @@
+# Managed by Ansible (role: jenkins_agent).
+[Unit]
+Description=Jenkins inbound (JNLP) build agent ({{ jenkins_agent_name }})
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User={{ jenkins_agent_run_user }}
+EnvironmentFile={{ jenkins_agent_env_file }}
+# Keep agent.jar in sync with the controller's version (best-effort).
+ExecStartPre=-/usr/bin/curl -fsSL -o {{ jenkins_agent_jar }} {{ jenkins_agent_controller_url }}jnlpJars/agent.jar
+ExecStart={{ jenkins_agent_java }} -jar {{ jenkins_agent_jar }} -url {{ jenkins_agent_controller_url }} -name {{ jenkins_agent_name }} -secret ${JENKINS_AGENT_SECRET} -workDir {{ jenkins_agent_workdir }}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

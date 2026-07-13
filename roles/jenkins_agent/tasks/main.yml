@@ -9,6 +9,17 @@
 #   1. a buildkit GC policy in /etc/docker/daemon.json  -> bounds build cache
 #   2. a systemd timer running docker-gc.sh             -> reclaims stale images
 
+- name: Require the agent identity vars (from gitignored host_vars/jenkins_agent.yml)
+  ansible.builtin.assert:
+    that:
+      - jenkins_agent_vmid is defined
+      - jenkins_agent_name is defined
+      - jenkins_agent_workdir is defined
+      - jenkins_agent_jar is defined
+    fail_msg: >-
+      Agent identity is not set. Provide host_vars/jenkins_agent.yml with
+      jenkins_agent_vmid/_name/_workdir/_jar (it's gitignored, not in the repo).
+
 - name: Confirm the guest agent is responsive
   ansible.builtin.command:
     argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/true]
@@ -111,3 +122,58 @@
   changed_when: true
   failed_when: jenkins_agent_gc_now.rc != 0 or (jenkins_agent_gc_now.stdout | from_json).exitcode | default(1) != 0
   when: jenkins_agent_gc_run_now | bool
+
+# --- 3. inbound (JNLP) agent under systemd ----------------------------------
+# Without a supervisor the hand-launched agent dies on reboot/controller
+# restart. Run it as a service so it auto-starts and reconnects.
+
+- name: Require the agent secret when managing the agent service
+  ansible.builtin.assert:
+    that:
+      - jenkins_agent_secret | length > 0
+    fail_msg: >-
+      jenkins_agent_secret is empty. Put the JNLP secret for {{ jenkins_agent_name }}
+      (Manage Jenkins > Nodes > {{ jenkins_agent_name }}) into secrets.yml.
+  when: jenkins_agent_manage_service | bool
+
+- name: Install the agent secret env file
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: "{{ jenkins_agent_env_file }}"
+    gf_content: "JENKINS_AGENT_SECRET={{ jenkins_agent_secret }}\n"
+    gf_mode: "0600"
+    gf_changed_var: jenkins_agent_svc_changed
+  when: jenkins_agent_manage_service | bool
+
+- name: Install the jenkins-agent systemd service
+  ansible.builtin.include_tasks: guest_file.yml
+  vars:
+    gf_dest: /etc/systemd/system/jenkins-agent.service
+    gf_content: "{{ lookup('ansible.builtin.template', 'jenkins-agent.service.j2') }}"
+    gf_mode: "0644"
+    gf_changed_var: jenkins_agent_svc_changed
+  when: jenkins_agent_manage_service | bool
+
+- name: Reload systemd after agent unit change
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/systemctl, daemon-reload]
+  register: jenkins_agent_svc_reload
+  changed_when: true
+  failed_when: jenkins_agent_svc_reload.rc != 0 or (jenkins_agent_svc_reload.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_manage_service | bool and (jenkins_agent_svc_changed | default(false))
+
+- name: Enable and start the jenkins-agent service
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--", /bin/systemctl, enable, --now, jenkins-agent.service]
+  register: jenkins_agent_svc_enable
+  changed_when: "'Created symlink' in ((jenkins_agent_svc_enable.stdout | from_json)['err-data'] | default('') ~ (jenkins_agent_svc_enable.stdout | from_json)['out-data'] | default(''))"
+  failed_when: jenkins_agent_svc_enable.rc != 0 or (jenkins_agent_svc_enable.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_manage_service | bool
+
+- name: Restart the jenkins-agent service to apply changes
+  ansible.builtin.command:
+    argv: [qm, guest, exec, "{{ jenkins_agent_vmid }}", "--timeout", "30", "--", /bin/systemctl, restart, jenkins-agent.service]
+  register: jenkins_agent_svc_restart
+  changed_when: true
+  failed_when: jenkins_agent_svc_restart.rc != 0 or (jenkins_agent_svc_restart.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_manage_service | bool and (jenkins_agent_svc_changed | default(false))

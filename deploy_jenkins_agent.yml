@@ -1,14 +1,23 @@
 ---
-# Configure the Jenkins build agent's Docker GC.
+# Configure the Jenkins build agent (Docker GC + inbound-agent systemd service).
 #
-# The agent is VM 310 on pve1, created out of band and not reachable with our
-# SSH key, so the play targets the pve *host* and drives the guest through the
-# qemu guest agent (`qm guest exec`). Override the target with -e or a var if
-# the agent ever moves to another node.
-- name: Configure Jenkins build agent (Docker GC) via the pve guest agent
+# The agent VM was created out of band and isn't reachable with our SSH key, so
+# the play targets the pve *host* and drives the guest through the qemu guest
+# agent (`qm guest exec`). The agent's identity (vmid/name/paths) lives in the
+# gitignored host_vars of jenkins_agent_node and is mapped into play vars below,
+# mirroring the connect_*_to_jenkins.yml playbooks.
+- name: Configure Jenkins build agent (Docker GC + inbound agent service) via the pve guest agent
   hosts: "{{ jenkins_agent_pve_target | default('pve1') }}"
   become: true
   gather_facts: false
+  vars_files:
+    - secrets.yml
+  vars:
+    jenkins_agent_host: "{{ groups['jenkins_agent_group'] | first }}"
+    jenkins_agent_vmid: "{{ hostvars[jenkins_agent_host].jenkins_agent_vmid }}"
+    jenkins_agent_name: "{{ hostvars[jenkins_agent_host].jenkins_agent_name }}"
+    jenkins_agent_workdir: "{{ hostvars[jenkins_agent_host].jenkins_agent_workdir }}"
+    jenkins_agent_jar: "{{ hostvars[jenkins_agent_host].jenkins_agent_jar }}"
 
   roles:
     - jenkins_agent
