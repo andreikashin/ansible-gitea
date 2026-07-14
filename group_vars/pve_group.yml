@@ -19,3 +19,28 @@ proxmox_backup_config_items:
     local_name: hosts
   - src: /etc/resolv.conf
     local_name: resolv.conf
+
+# Full node configuration snapshot as a single tar.gz. Unlike the list above
+# (individual human-readable files) this captures the whole /etc/pve — what you
+# need to restore users/ACLs (user.cfg), passwords (priv/shadow.cfg), API tokens
+# (priv/token.cfg), 2FA (priv/tfa.cfg), the firewall, datacenter settings, guest
+# configs (qemu-server/*.conf) and the CA. /etc/pve is pmxcfs (FUSE); tar reads
+# it as regular files. While reading a live pmxcfs tar may return rc=1
+# ("file changed as we read it"), which is treated as success.
+proxmox_backup_node_config: true
+proxmox_backup_node_config_paths:
+  - /etc/pve
+  - /etc/network/interfaces
+  - /etc/hosts
+  - /etc/hostname
+  - /etc/resolv.conf
+  - /etc/ssh
+  # OS accounts: PVE users in the @pam realm authenticate via Linux, so their
+  # logins/passwords live here, not in /etc/pve. Without these, user.cfg
+  # restores only the user object and permissions, not the ability to log in.
+  - /etc/passwd
+  - /etc/shadow
+  - /etc/group
+  - /etc/gshadow
+  - /etc/sudoers
+  - /etc/sudoers.d

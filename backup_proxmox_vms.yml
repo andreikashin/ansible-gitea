@@ -264,6 +264,73 @@
         loop_var: proxmox_config_item
         label: "{{ proxmox_config_item.local_name }}"
 
+    # Full node configuration (the whole /etc/pve plus network/ssh) as one tar.gz.
+    # Needed to restore users, tokens, 2FA, the firewall and the CA — everything
+    # that is not covered by the individual files above.
+    - name: Back up full Proxmox node configuration as a tarball
+      when: proxmox_backup_node_config | default(true) | bool
+      block:
+        - name: Determine node config archive timestamp
+          command: date +%Y_%m_%d-%H_%M_%S
+          register: proxmox_node_config_ts
+          changed_when: false
+
+        - name: Set node config archive paths
+          set_fact:
+            proxmox_node_config_remote: "/tmp/pve-config-{{ proxmox_node_name }}-{{ proxmox_node_config_ts.stdout | trim }}.tar.gz"
+          changed_when: false
+
+        - name: Build node config tar argv
+          set_fact:
+            proxmox_node_config_argv: >-
+              {{
+                ['tar', '-czf', proxmox_node_config_remote,
+                 '--ignore-failed-read', '--warning=no-file-changed']
+                + proxmox_backup_node_config_paths
+              }}
+          changed_when: false
+
+        # tar over a live pmxcfs may return rc=1 (a file changed while being read),
+        # which is not an error. A real failure is rc >= 2.
+        - name: Create node configuration tarball on the Proxmox host
+          command:
+            argv: "{{ proxmox_node_config_argv }}"
+          register: proxmox_node_config_tar
+          changed_when: proxmox_node_config_tar.rc == 0
+          failed_when: proxmox_node_config_tar.rc not in [0, 1]
+
+        - name: Fetch node configuration tarball to local destination
+          fetch:
+            src: "{{ proxmox_node_config_remote }}"
+            dest: "{{ proxmox_backup_host_dir }}/"
+            flat: true
+          become: false
+          register: proxmox_node_config_fetch
+
+        - name: Remove node configuration tarball from the Proxmox host
+          file:
+            path: "{{ proxmox_node_config_remote }}"
+            state: absent
+
+        - name: Remember node configuration archive
+          set_fact:
+            proxmox_copied_config_files: >-
+              {{ (proxmox_copied_config_files | default([])) + [proxmox_node_config_remote | basename] }}
+          changed_when: false
+      rescue:
+        - name: Record failed node configuration archive
+          set_fact:
+            proxmox_failed_config_files: >-
+              {{ (proxmox_failed_config_files | default([])) + ['pve-config tarball'] }}
+          changed_when: false
+
+        - name: Report node configuration archive failure
+          debug:
+            msg: >-
+              Failed to create/fetch the full node configuration tarball from {{ inventory_hostname }}.
+              vzdump backups and individual config files are unaffected.
+          changed_when: false
+
     - name: Report backup summary
       debug:
         msg: >-
