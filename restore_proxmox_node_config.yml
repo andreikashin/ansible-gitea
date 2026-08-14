@@ -1,0 +1,204 @@
+---
+# Безопасное восстановление хостовых конфигов Proxmox-ноды из локального бэкапа.
+# Обратная операция к backup_proxmox_config_item.yml: берёт файлы из
+# {{ proxmox_backup_host_dir }} (= proxmox_backup_local_dir/<folder>, напр.
+# D:\backup\pve1) и кладёт их обратно на ноду по их путям (proxmox_backup_config_items).
+#
+# ГЛАВНОЕ — сетевой предохранитель. Перед тем как восстановить
+# /etc/network/interfaces, проверяется, что ВСЕ физические порты, на которые он
+# ссылается (bridge-ports / bond-slaves), реально присутствуют на целевой ноде.
+# Это ловит "протухший бэкап": после переустановки PVE карта переименовывается
+# (напр. enp3s0f0 -> запиненный nic0), старый interfaces ссылается на
+# несуществующее имя, vmbr0 остаётся без аплинка и вся сеть ложится.
+# Если хоть один порт отсутствует — interfaces НЕ применяется, плейбук падает
+# с понятным сообщением. (См. историю инцидента 2026-07 с pve1.)
+#
+# Поведение:
+#   * по умолчанию — режим проверки (dry-run): ничего не пишется, только валидация
+#     и отчёт, что было бы восстановлено;
+#   * чтобы реально применить:            -e restore_apply=true
+#   * сеть НЕ перезагружается автоматически (чтобы не оборвать SSH); применить
+#     потом вручную: `ifreload -a` на ноде или ребут. Либо -e restore_reload_network=true.
+#
+# Примеры:
+#   ansible-playbook restore_proxmox_node_config.yml --limit pve1                     # проверка
+#   ansible-playbook restore_proxmox_node_config.yml --limit pve1 -e restore_apply=true
+#   ansible-playbook restore_proxmox_node_config.yml --limit pve1 \
+#       -e restore_apply=true -e 'restore_only=["interfaces"]'                        # только сеть
+
+- name: Restore Proxmox host config from local backup (with network safety check)
+  hosts: "{{ restore_hosts | default('pve_group') }}"
+  become: true
+  gather_facts: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+  vars:
+    # Реально писать на ноду (иначе — только проверка/отчёт).
+    restore_apply: false
+    # После восстановления interfaces перечитать сеть на ноде (ifreload -a). Опасно
+    # по SSH: при неверном конфиге можно потерять связь. Предохранитель ниже страхует.
+    restore_reload_network: false
+    # Что восстанавливать. По умолчанию — весь набор из group_vars.
+    restore_config_items: "{{ proxmox_backup_config_items }}"
+    # Необязательный фильтр по local_name, напр. -e 'restore_only=["interfaces"]'.
+    restore_only: []
+    _rst_items: >-
+      {{ restore_config_items
+         | selectattr('local_name', 'in', restore_only) | list
+         if (restore_only | length > 0) else restore_config_items }}
+
+  tasks:
+    - name: Local backup directory must exist on the control node
+      delegate_to: localhost
+      become: false
+      stat:
+        path: "{{ proxmox_backup_host_dir }}"
+      register: _rst_dir
+
+    - name: Fail early if the backup directory is missing
+      assert:
+        that: _rst_dir.stat.exists and _rst_dir.stat.isdir
+        fail_msg: >-
+          Локальный каталог бэкапа {{ proxmox_backup_host_dir }} не найден.
+          Проверь proxmox_backup_local_dir / proxmox_backup_folder_name.
+        quiet: true
+
+    # ---------------------------------------------------------------------------
+    # ПРЕДОХРАНИТЕЛЬ: сверяем порты из кандидата-interfaces с реальными NIC ноды.
+    # Выполняется всегда (в т.ч. в dry-run) — это и есть главная проверка.
+    # ---------------------------------------------------------------------------
+    - name: Find the interfaces item among those being restored
+      set_fact:
+        _rst_iface_item: >-
+          {{ (_rst_items | selectattr('src', 'equalto', '/etc/network/interfaces')
+              | list | first) | default({}) }}
+
+    - name: Network interfaces safety check
+      when: _rst_iface_item.src is defined
+      block:
+        - name: Resolve local candidate interfaces path
+          set_fact:
+            _rst_iface_local: "{{ proxmox_backup_host_dir }}/{{ _rst_iface_item.local_name }}"
+
+        - name: Candidate interfaces file must exist in the backup
+          delegate_to: localhost
+          become: false
+          stat:
+            path: "{{ _rst_iface_local }}"
+          register: _rst_iface_stat
+
+        - name: Fail if the candidate interfaces file is missing
+          assert:
+            that: _rst_iface_stat.stat.exists
+            fail_msg: "В бэкапе нет файла {{ _rst_iface_local }} — восстанавливать нечего."
+            quiet: true
+
+        - name: Stage candidate interfaces into a temp file on the node (NOT applied)
+          copy:
+            src: "{{ _rst_iface_local }}"
+            dest: /tmp/.restore-interfaces.candidate
+            mode: '0600'
+
+        - name: Verify every bridge-port / bond-slave in the candidate exists on the node
+          shell: |
+            set -o pipefail
+            f=/tmp/.restore-interfaces.candidate
+            [ -f "$f" ] || { echo "NO_CANDIDATE"; exit 2; }
+            # Разбираем станцы interfaces. "Создаётся ifupdown" = только мост/бонд
+            # (у станцы есть bridge-ports/bond-slaves), а НЕ любая iface-строка:
+            # PVE-шный interfaces объявляет каждую физкарту как `iface X inet manual`,
+            # и её наличие в файле ещё не значит, что устройство X существует.
+            # req = порты bridge-ports/bond-slaves (корень VLAN), которые сами не
+            # являются объявленным в файле мостом/бондом.
+            req=$(awk '
+            function addref(list,   n,i,a,v){ n=split(list,a," "); for(i=1;i<=n;i++){ v=a[i]; sub(/\..*/,"",v); if(v!=""&&v!="none"&&v!="glob"&&v!="regex"&&v!="all") refs[v]=1 } }
+            { line=$0; sub(/\r$/,"",line); sub(/#.*/,"",line);
+              if(match(line,/^[ \t]*iface[ \t]+/)){ cur=substr(line,RLENGTH+1); sub(/[ \t].*/,"",cur); next }
+              if(match(line,/^[ \t]*(bridge[-_]ports|bond[-_]slaves|slaves)[ \t]+/)){ val=substr(line,RLENGTH+1); if(cur!="")created[cur]=1; addref(val); next }
+            }
+            END{ for(r in refs) if(!(r in created)) print r }' "$f")
+            miss=""
+            for root in $req; do [ -e "/sys/class/net/$root" ] || miss="$miss $root"; done
+            present=$(ls -1 /sys/class/net 2>/dev/null | tr '\n' ' ')
+            if [ -n "$miss" ]; then
+              echo "MISSING:${miss# }"
+              echo "PRESENT:$present"
+              exit 3
+            fi
+            echo "OK required=[$(echo $req | tr '\n' ' ')]"
+            echo "PRESENT:$present"
+          args:
+            executable: /bin/bash
+          register: _rst_iface_check
+          changed_when: false
+          failed_when: false
+
+        - name: Refuse to restore interfaces if it references NICs absent on the node
+          assert:
+            that: _rst_iface_check.rc == 0
+            fail_msg: >-
+              ОТКАЗ восстанавливать /etc/network/interfaces на {{ inventory_hostname }}:
+              конфиг ссылается на сетевые устройства, которых на ноде НЕТ.
+              {{ _rst_iface_check.stdout }}
+              Это ровно "протухший бэкап" (напр. enp3s0f0 из до-переустановочной копии
+              против запиненного nic0). Поправь имя порта в бэкапе
+              ({{ _rst_iface_local }}) под реальное, либо восстанови только прикладные
+              конфиги: -e 'restore_only=["storage.cfg","hosts","resolv.conf"]'.
+            success_msg: "interfaces OK — все порты существуют на {{ inventory_hostname }}. {{ _rst_iface_check.stdout_lines | first }}"
+            quiet: true
+
+    # ---------------------------------------------------------------------------
+    # Применение (только при restore_apply=true). В dry-run — просто отчёт.
+    # ---------------------------------------------------------------------------
+    - name: Timestamp for pre-restore backups
+      command: date -u +%Y%m%dT%H%M%SZ
+      register: _rst_ts
+      changed_when: false
+      when: restore_apply | bool
+
+    - name: DRY-RUN plan (nothing written)
+      debug:
+        msg: >-
+          [DRY-RUN] Восстановил бы на {{ inventory_hostname }}:
+          {{ _rst_items | map(attribute='src') | join(', ') }}.
+          Сетевой предохранитель:
+          {{ 'interfaces прошёл проверку' if _rst_iface_item.src is defined else 'interfaces не в наборе' }}.
+          Запусти с -e restore_apply=true, чтобы применить.
+      when: not (restore_apply | bool)
+
+    - name: Apply restored config files
+      when: restore_apply | bool
+      block:
+        - name: Back up current file on the node before overwriting
+          shell: 'test -e {{ item.src | quote }} && cp -a {{ item.src | quote }} {{ (item.src ~ ".pre-restore-" ~ _rst_ts.stdout) | quote }} || true'
+          args:
+            executable: /bin/bash
+          loop: "{{ _rst_items }}"
+          loop_control:
+            label: "{{ item.src }}"
+          changed_when: true
+
+        - name: Copy each config file from local backup onto the node
+          copy:
+            src: "{{ proxmox_backup_host_dir }}/{{ item.local_name }}"
+            dest: "{{ item.src }}"
+          loop: "{{ _rst_items }}"
+          loop_control:
+            label: "{{ item.src }} <- {{ item.local_name }}"
+
+        - name: Reload node networking (optional, guarded by the port check above)
+          command: ifreload -a
+          when:
+            - restore_reload_network | bool
+            - _rst_iface_item.src is defined
+
+        - name: Applied summary
+          debug:
+            msg: >-
+              Восстановлено на {{ inventory_hostname }}:
+              {{ _rst_items | map(attribute='src') | join(', ') }}
+              (старые версии сохранены как *.pre-restore-{{ _rst_ts.stdout }}).
+              {{ 'Сеть перечитана (ifreload -a).'
+                 if (restore_reload_network | bool and _rst_iface_item.src is defined)
+                 else 'Сеть НЕ перезагружалась — применится на следующем ifreload -a / ребуте.' }}
