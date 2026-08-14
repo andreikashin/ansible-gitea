@@ -1,0 +1,5 @@
+---
+- name: Restart Inference Gateway
+  community.docker.docker_compose_v2:
+    project_src: "{{ inference_gateway_install_dir }}"
+    state: restarted

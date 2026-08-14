@@ -1,0 +1,87 @@
+---
+# Shared Ollama inference endpoint, fronted by Traefik.
+#
+# Ollama has no authentication of its own, so it is never exposed directly: it
+# publishes no host port and is reachable only over the compose network. Traefik
+# takes its place on the LAN and admits a request only when it presents a known
+# project key AND targets a path that project is allowed to use.
+#
+# Consequence worth knowing: /api/delete, /api/pull, /api/create and /api/push
+# appear in no route, so no key can reach them. Models shared by several projects
+# cannot be destroyed through the gateway.
+
+- name: Install QEMU Guest Agent and update cache
+  apt:
+    name: qemu-guest-agent
+    state: present
+    update_cache: yes
+
+- name: Verify project keys are defined
+  # An empty key would render the rule `Bearer `, which matches a request whose
+  # Authorization header is exactly that — turning a forgotten variable into an
+  # open endpoint rather than a broken one. Fail before that reaches a config.
+  assert:
+    that:
+      - inference_gateway_keys[item.project] is defined
+      - inference_gateway_keys[item.project] | length >= 16
+    fail_msg: >-
+      inference_gateway_keys['{{ item.project }}'] is missing or too short.
+      Define it in host_vars (gitignored) for every project in
+      inference_gateway_routes.
+  loop: "{{ inference_gateway_routes }}"
+  loop_control:
+    label: "{{ item.project }}"
+
+- name: Create app directory
+  file:
+    path: "{{ inference_gateway_install_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Create dynamic config directory
+  file:
+    path: "{{ inference_gateway_install_dir }}/dynamic"
+    state: directory
+    mode: '0755'
+
+- name: Generate routers.yml (project keys and allowed paths)
+  template:
+    src: routers.yml.j2
+    dest: "{{ inference_gateway_install_dir }}/dynamic/routers.yml"
+    mode: '0600'  # contains project keys
+  notify: Restart Inference Gateway
+
+- name: Generate compose.yml
+  template:
+    src: compose.yml.j2
+    dest: "{{ inference_gateway_install_dir }}/compose.yml"
+    mode: '0644'
+  notify: Restart Inference Gateway
+
+- name: Start Inference Gateway
+  community.docker.docker_compose_v2:
+    project_src: "{{ inference_gateway_install_dir }}"
+    state: present
+
+- name: Wait for Ollama to answer inside the compose network
+  # Checked from inside the gateway container: Ollama has no host port, so there
+  # is nothing to probe from the host itself.
+  command: >-
+    docker compose -f {{ inference_gateway_install_dir }}/compose.yml
+    exec -T ollama ollama list
+  register: ollama_ready
+  retries: 10
+  delay: 6
+  until: ollama_ready.rc == 0
+  changed_when: false
+
+- name: Pull models
+  # Models are shared by every consuming project, which is also why the gateway
+  # refuses /api/pull: they are provisioned here, deliberately, not by whichever
+  # client asks first.
+  command: >-
+    docker compose -f {{ inference_gateway_install_dir }}/compose.yml
+    exec -T ollama ollama pull {{ item }}
+  loop: "{{ inference_gateway_models }}"
+  register: model_pull
+  changed_when: "'pulling' in model_pull.stdout | default('')"

@@ -1,0 +1,72 @@
+# Managed by Ansible (roles/inference_gateway) — do not edit on the host.
+services:
+  gateway:
+    image: traefik:v3.3
+    container_name: inference-gateway
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command:
+      # Routes come from a file rather than container labels: the file holds the
+      # project keys, and is rendered here with mode 0600.
+      - "--providers.file.directory=/etc/traefik/dynamic"
+      - "--providers.file.watch=true"
+      - "--entrypoints.ollama.address=:{{ inference_gateway_port }}"
+      - "--accesslog=true"
+      # Log the router that served each request — that is how a project is
+      # identified after the fact, since every project has its own router.
+      - "--accesslog.fields.names.RouterName=keep"
+      - "--log.level={{ inference_gateway_log_level }}"
+      - "--api.dashboard=false"
+      # Streaming: generation runs for as long as it runs. writeTimeout=0 removes
+      # the response deadline; any finite value truncates a stream mid-answer.
+      - "--entrypoints.ollama.transport.respondingTimeouts.readTimeout=60s"
+      - "--entrypoints.ollama.transport.respondingTimeouts.writeTimeout=0s"
+      - "--entrypoints.ollama.transport.respondingTimeouts.idleTimeout=620s"
+    ports:
+      # Same port Ollama would have used, so consumers change only the host.
+      - "{{ inference_gateway_bind }}:{{ inference_gateway_port }}:{{ inference_gateway_port }}"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./dynamic:/etc/traefik/dynamic:ro
+    depends_on:
+      - ollama
+    networks:
+      - inference
+
+  ollama:
+    image: ollama/ollama:{{ inference_gateway_ollama_tag }}
+    container_name: ollama
+    restart: unless-stopped
+    # Deliberately no `ports:` — this is the structural half of the protection.
+    # Ollama is reachable only through the gateway, whatever the firewall says.
+    expose:
+      - "11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      # Keep a model resident between requests; loading a 7B onto the card is the
+      # dominant cost for short prompts.
+      OLLAMA_KEEP_ALIVE: "{{ inference_gateway_keep_alive }}"
+      # How many models may occupy VRAM at once. Raising this avoids swapping
+      # between the projects' models — worth measuring actual usage against the
+      # card's capacity before deciding.
+      OLLAMA_MAX_LOADED_MODELS: "{{ inference_gateway_max_loaded_models }}"
+      OLLAMA_NUM_PARALLEL: "{{ inference_gateway_num_parallel }}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - inference
+
+volumes:
+  ollama_models:
+    driver: local
+
+networks:
+  inference:
+    driver: bridge

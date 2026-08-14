@@ -1,0 +1,23 @@
+# Template for host_vars/inference_gateway_node.yml (gitignored).
+# Copy, fill in, and add the host to [inference_gateway_group] in inventory.ini.
+
+ansible_host: 192.168.1.x   # GPU host / guest with the card passed through
+ansible_user: root
+
+# ── Project keys ──────────────────────────────────────────
+# One per consuming project. Every project named in inference_gateway_routes
+# (group_vars/inference_gateway_group.yml) needs an entry here, or the play fails
+# before writing a config — an empty value would render the rule `Bearer `, which
+# matches any request whose Authorization header is exactly that, turning a
+# forgotten variable into an open endpoint instead of a broken one.
+#
+# Generate:
+#   openssl rand -base64 32 | tr -d '=+/' | cut -c1-40
+#
+# Vault is the source of truth (LAB_PLAN §8); it is read when rendering, never in
+# the request path — inference keeps serving while Vault is down.
+#   vault kv put secret/inference-gateway llaima='...' semantiplex='...' asynclair='...'
+inference_gateway_keys:
+  llaima: ""
+  semantiplex: ""
+  asynclair: ""

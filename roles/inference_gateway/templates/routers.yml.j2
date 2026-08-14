@@ -1,0 +1,54 @@
+# Managed by Ansible (roles/inference_gateway) — do not edit on the host.
+# CONTAINS PROJECT KEYS (mode 0600). Generated from inference_gateway_routes and
+# inference_gateway_keys; the keys live in gitignored host_vars.
+#
+# ── How authorisation works here ───────────────────────────────────────────
+#
+# Each route's rule names both a project's key and the exact paths that key may
+# reach. Two consequences worth being explicit about:
+#
+#   1. Default deny by construction. /api/delete, /api/pull, /api/create and
+#      /api/push appear in no rule, so no route exists for them and no key can
+#      reach them. There is no blocklist to keep in sync — an endpoint is
+#      unreachable unless someone deliberately adds it to inference_gateway_routes.
+#
+#   2. A wrong or missing key produces 404, not 401. The rule simply does not
+#      match and Traefik has no route to offer. Good for not confirming what lives
+#      here; a debugging trap if forgotten. When a consumer reports 404 on a path
+#      that plainly exists, suspect the key first — the access log shows an empty
+#      RouterName for such requests.
+#
+# Rate limits are keyed by the Authorization header rather than source IP, so a
+# project shares one bucket across all of its instances instead of getting a
+# separate allowance per replica.
+
+http:
+  services:
+    ollama:
+      loadBalancer:
+        servers:
+          - url: "http://ollama:11434"
+        # Push bytes onward as they arrive instead of accumulating them: required
+        # for both native Ollama streaming and OpenAI-style SSE.
+        responseForwarding:
+          flushInterval: 100ms
+
+  routers:
+{% for route in inference_gateway_routes %}
+    {{ route.name }}:
+      entryPoints: [ollama]
+      rule: "Header(`Authorization`, `Bearer {{ inference_gateway_keys[route.project] }}`) && ({{ route.rule }})"
+      service: ollama
+      middlewares: ["{{ route.name }}-ratelimit"]
+{% endfor %}
+
+  middlewares:
+{% for route in inference_gateway_routes %}
+    {{ route.name }}-ratelimit:
+      rateLimit:
+        average: {{ route.rate_average }}
+        burst: {{ route.rate_burst }}
+        period: 1m
+        sourceCriterion:
+          requestHeaderName: Authorization
+{% endfor %}

@@ -1,0 +1,138 @@
+---
+# Shared Ollama inference endpoint behind an authorising gateway (GPU host).
+#
+# Prerequisite this play does NOT handle: the NVIDIA driver must already be
+# working on the target, i.e. `nvidia-smi` lists the card. On Proxmox that means
+# the passthrough (VFIO to a VM, or device binding for an LXC) is already done —
+# see LAB_PLAN §2.1, where it is still an open question. The container toolkit
+# installed below only lets Docker hand an existing device to a container; it
+# cannot conjure a driver.
+- name: Prepare Host and Deploy Inference Gateway
+  hosts: inference_gateway_group
+  become: true
+  vars:
+    docker_package_state: present
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install Basic Packages and QEMU Agent
+      apt:
+        name:
+          - qemu-guest-agent
+          - curl
+          - gnupg
+          - python3-pip  # pip is required
+        state: present
+
+    # IMPORTANT: Remove package from repository
+    - name: Remove system python3-docker
+      apt:
+        name: python3-docker
+        state: absent
+
+    # IMPORTANT: Install correct library via PIP
+    - name: Install Docker SDK via pip
+      pip:
+        name:
+          - docker
+          - requests
+        state: present
+        # This flag is needed for Debian 12/13 to allow pip installation
+        extra_args: "--break-system-packages"
+
+    # === Installing Docker ===
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Download Docker install script
+      get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: '0755'
+      when: docker_check.failed
+
+    - name: Run Docker install script
+      command: /tmp/get-docker.sh
+      when: docker_check.failed
+
+    # === GPU: NVIDIA Container Toolkit ===
+    # Lets Docker pass the card into the Ollama container. Fails loudly here
+    # rather than leaving Ollama silently running on CPU, which looks like
+    # "inference is just slow" and wastes an afternoon.
+    - name: Check for NVIDIA driver on the host
+      command: nvidia-smi
+      register: nvidia_smi
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Fail if the GPU is not visible to the host
+      fail:
+        msg: >-
+          nvidia-smi failed on {{ inventory_hostname }}. The GPU passthrough is
+          not in place, so there is nothing for the container toolkit to hand to
+          Ollama. Resolve the passthrough first (LAB_PLAN §2.1).
+      when: nvidia_smi.rc != 0
+
+    - name: Check if NVIDIA Container Toolkit is installed
+      command: nvidia-ctk --version
+      register: nvidia_ctk_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Add NVIDIA Container Toolkit GPG key
+      apt_key:
+        url: https://nvidia.github.io/libnvidia-container/gpgkey
+        keyring: /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+        state: present
+      when: nvidia_ctk_check.failed
+
+    - name: Add NVIDIA Container Toolkit repository
+      apt_repository:
+        repo: >-
+          deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg]
+          https://nvidia.github.io/libnvidia-container/stable/deb/$(ARCH) /
+        filename: nvidia-container-toolkit
+        state: present
+        update_cache: yes
+      when: nvidia_ctk_check.failed
+
+    - name: Install NVIDIA Container Toolkit
+      apt:
+        name: nvidia-container-toolkit
+        state: present
+      when: nvidia_ctk_check.failed
+
+    - name: Configure Docker to use the NVIDIA runtime
+      command: nvidia-ctk runtime configure --runtime=docker
+      when: nvidia_ctk_check.failed
+      notify: Restart Docker
+
+  handlers:
+    - name: Restart Docker
+      service:
+        name: docker
+        state: restarted
+
+  roles:
+    - inference_gateway
+
+  post_tasks:
+    # Confirms the card actually reached the container. Without this the play can
+    # report success while Ollama runs on CPU.
+    - name: Verify the GPU is visible inside the Ollama container
+      command: >-
+        docker compose -f {{ inference_gateway_install_dir }}/compose.yml
+        exec -T ollama nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+      register: container_gpu
+      changed_when: false
+
+    - name: Report the GPU seen by Ollama
+      debug:
+        msg: "Ollama sees: {{ container_gpu.stdout }}"
