@@ -9,3 +9,4 @@ secrets.yaml
 *.pem
 *.env
 *.log
+.claude/settings.local.json
