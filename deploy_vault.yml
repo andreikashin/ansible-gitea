@@ -1,0 +1,296 @@
+---
+# Развёртывание HashiCorp Vault на выделенной Debian-ВМ (Proxmox).
+#   Play 1 (pve-нода): клонирует Debian cloud-init шаблон в новую ВМ,
+#           настраивает cloud-init (статич. IP / ssh-ключ / юзер), запускает, ждёт SSH.
+#   Play 2 (новая ВМ): ставит и конфигурит Vault (Raft-storage + TLS, LAN listener).
+#           Поднимается ЗАПЕЧАТАННЫМ. Инициализация/распечатка — вручную, см. VAULT_RUNBOOK.md.
+#
+# Обязательные переменные (-e):
+#   vault_pve_node    - inventory-имя pve-ноды (напр. pveX)
+#   vault_vmid        - VMID новой ВМ
+#   vault_template_id - VMID Debian cloud-init шаблона на ноде.
+#                       Если шаблона нет — соберётся из официального Debian cloud-образа
+#                       (vault_template_autobuild=true, по умолчанию).
+#   vault_ip          - статич. IP/CIDR ВМ (напр. 192.0.2.210/24)
+#   vault_ssh_pubkey  - публичный ключ для доступа к ВМ
+#
+# Пример (адреса — подставь свои; 192.0.2.0/24 — документационная сеть RFC 5737):
+#   ansible-playbook deploy_vault.yml \
+#     -e vault_pve_node=pveX -e vault_vmid=<VMID> -e vault_template_id=<TMPL_VMID> \
+#     -e vault_ip=192.0.2.210/24 \
+#     -e "vault_ssh_pubkey=$(cat ~/.ssh/id_rsa.pub)"
+
+- name: Create the Vault VM on the target pve node
+  hosts: "{{ vault_pve_node }}"
+  become: true
+  gather_facts: false
+  environment:
+    PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  vars:
+    vault_name: vault
+    vault_cores: 1
+    vault_memory: 1024
+    vault_disk_gb: 10
+    vault_storage: local-lvm
+    vault_bridge: vmbr0
+    vault_bootdisk: scsi0
+    vault_ciuser: debian
+    # Если шаблона vault_template_id на ноде НЕТ — собрать его из официального
+    # облачного образа Debian (аналог "docker pull" базового образа).
+    # false = требовать заранее готовый шаблон и падать, если его нет.
+    vault_template_autobuild: true
+    vault_cloud_image_url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    vault_cloud_image_path: "/var/lib/vz/template/iso/{{ vault_cloud_image_url | basename }}"
+    # шлюз по умолчанию — .1 из подсети IP (переопредели -e vault_gw=... при иной схеме)
+    vault_gw: "{{ (vault_ip.split('/')[0].split('.')[0:3] | join('.')) ~ '.1' }}"
+    vault_ip_bare: "{{ vault_ip.split('/')[0] }}"
+
+  tasks:
+    - name: Validate required vars
+      assert:
+        that:
+          - vault_pve_node is defined and (vault_pve_node | length > 0)
+          - vault_vmid is defined
+          - vault_template_id is defined
+          - vault_ip is defined and ('/' in vault_ip)
+          - vault_ssh_pubkey is defined and (vault_ssh_pubkey | length > 20)
+        fail_msg: >-
+          Задай vault_pve_node, vault_vmid, vault_template_id, vault_ip (CIDR) и vault_ssh_pubkey.
+        quiet: true
+
+    - name: Check whether the VM already exists
+      command: "qm status {{ vault_vmid }}"
+      register: vault_vm_stat
+      failed_when: false
+      changed_when: false
+
+    - name: Check whether the source template exists on this node
+      command: "qm status {{ vault_template_id }}"
+      register: vault_tmpl_stat
+      failed_when: false
+      changed_when: false
+      when: vault_vm_stat.rc != 0
+
+    - name: Fail if template is missing and autobuild is disabled
+      assert:
+        that: (vault_tmpl_stat.rc == 0) or (vault_template_autobuild | bool)
+        fail_msg: >-
+          Шаблон {{ vault_template_id }} не найден на {{ vault_pve_node }}, а
+          vault_template_autobuild=false. Либо создай шаблон, либо включи автосборку.
+        quiet: true
+      when: vault_vm_stat.rc != 0
+
+    # "docker pull" для ВМ: тянем официальный Debian cloud-образ и собираем template.
+    - name: Build the Debian cloud-init template from the official cloud image
+      when:
+        - vault_vm_stat.rc != 0
+        - vault_tmpl_stat.rc != 0
+        - vault_template_autobuild | bool
+      block:
+        - name: Download official Debian cloud image (qcow2)
+          get_url:
+            url: "{{ vault_cloud_image_url }}"
+            dest: "{{ vault_cloud_image_path }}"
+            mode: '0644'
+
+        - name: Create the template VM shell
+          command: >-
+            qm create {{ vault_template_id }} --name debian-cloud-tmpl
+            --memory 1024 --cores 1 --cpu host
+            --net0 virtio,bridge={{ vault_bridge }}
+            --scsihw virtio-scsi-single --ostype l26 --agent 1
+
+        - name: Import the cloud image as the boot disk (scsi0)
+          command: >-
+            qm set {{ vault_template_id }}
+            --scsi0 {{ vault_storage }}:0,import-from={{ vault_cloud_image_path }}
+
+        - name: Attach cloud-init drive + boot order + serial console
+          command: >-
+            qm set {{ vault_template_id }}
+            --ide2 {{ vault_storage }}:cloudinit
+            --boot order=scsi0 --serial0 socket --vga serial0
+
+        - name: Convert the VM into a template
+          command: "qm template {{ vault_template_id }}"
+
+    - name: Clone Debian template into the Vault VM
+      command: >-
+        qm clone {{ vault_template_id }} {{ vault_vmid }}
+        --name {{ vault_name }} --full 1 --storage {{ vault_storage }}
+      when: vault_vm_stat.rc != 0
+
+    - name: Drop the ssh public key into a temp file for cloud-init
+      copy:
+        content: "{{ vault_ssh_pubkey }}\n"
+        dest: "/tmp/vault-{{ vault_vmid }}.pub"
+        mode: '0600'
+      when: vault_vm_stat.rc != 0
+
+    - name: Configure VM resources + cloud-init
+      command: >-
+        qm set {{ vault_vmid }}
+        --cores {{ vault_cores }} --memory {{ vault_memory }} --agent 1
+        --net0 virtio,bridge={{ vault_bridge }}
+        --ipconfig0 ip={{ vault_ip }},gw={{ vault_gw }}
+        --ciuser {{ vault_ciuser }}
+        --sshkeys /tmp/vault-{{ vault_vmid }}.pub
+      when: vault_vm_stat.rc != 0
+
+    - name: Grow the boot disk to the requested size (ignore if already >=)
+      command: "qm resize {{ vault_vmid }} {{ vault_bootdisk }} {{ vault_disk_gb }}G"
+      register: vault_resize
+      failed_when: false
+      changed_when: vault_resize.rc == 0
+      when: vault_vm_stat.rc != 0
+
+    - name: Remove the temp key file
+      file:
+        path: "/tmp/vault-{{ vault_vmid }}.pub"
+        state: absent
+      when: vault_vm_stat.rc != 0
+
+    - name: Ensure the VM is running
+      command: "qm start {{ vault_vmid }}"
+      register: vault_start
+      changed_when: "'already running' not in (vault_start.stderr | default(''))"
+      failed_when:
+        - vault_start.rc != 0
+        - "'already running' not in (vault_start.stderr | default(''))"
+
+    - name: Wait for SSH on the new VM
+      wait_for:
+        host: "{{ vault_ip_bare }}"
+        port: 22
+        timeout: 300
+        delay: 5
+
+    - name: Register the new VM as an in-memory inventory host
+      add_host:
+        name: "{{ vault_ip_bare }}"
+        groups: vault_new
+        ansible_host: "{{ vault_ip_bare }}"
+        ansible_user: "{{ vault_ciuser }}"
+        vault_fqdn: "{{ vault_fqdn | default('vault.lan') }}"
+        vault_addr_ip: "{{ vault_ip_bare }}"
+      changed_when: false
+
+
+- name: Install and configure Vault on the new VM
+  hosts: vault_new
+  become: true
+  gather_facts: true
+  vars:
+    vault_fqdn: "{{ hostvars[inventory_hostname].vault_fqdn | default('vault.lan') }}"
+    vault_addr_ip: "{{ hostvars[inventory_hostname].vault_addr_ip | default(inventory_hostname) }}"
+    # если apt-репозиторий HashiCorp не имеет вашего релиза Debian — переопредели, напр. bookworm
+    vault_apt_dist: "{{ ansible_distribution_release }}"
+    vault_node_id: vault-1
+
+  handlers:
+    - name: restart vault
+      systemd:
+        name: vault
+        state: restarted
+
+  tasks:
+    - name: Install prerequisites
+      apt:
+        name: [curl, gnupg, openssl, qemu-guest-agent]
+        state: present
+        update_cache: true
+
+    - name: Enable qemu-guest-agent
+      systemd:
+        name: qemu-guest-agent
+        enabled: true
+        state: started
+
+    - name: Add HashiCorp apt signing key
+      get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /usr/share/keyrings/hashicorp.asc
+        mode: '0644'
+
+    - name: Add HashiCorp apt repository
+      apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com {{ vault_apt_dist }} main"
+        filename: hashicorp
+        state: present
+
+    - name: Install Vault
+      apt:
+        name: vault
+        state: present
+        update_cache: true
+
+    - name: Ensure Vault data + TLS directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: vault
+        group: vault
+        mode: '0750'
+      loop:
+        - /opt/vault/data
+        - /opt/vault/tls
+
+    - name: Generate a self-signed TLS cert (SAN = fqdn + IP), LAN-only
+      command: >-
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650
+        -keyout /opt/vault/tls/vault.key -out /opt/vault/tls/vault.crt
+        -subj "/CN={{ vault_fqdn }}"
+        -addext "subjectAltName=DNS:{{ vault_fqdn }},IP:{{ vault_addr_ip }}"
+      args:
+        creates: /opt/vault/tls/vault.crt
+
+    - name: Lock down TLS key/cert ownership
+      file:
+        path: "{{ item.p }}"
+        owner: vault
+        group: vault
+        mode: "{{ item.m }}"
+      loop:
+        - { p: /opt/vault/tls/vault.key, m: '0640' }
+        - { p: /opt/vault/tls/vault.crt, m: '0644' }
+
+    - name: Write Vault config (Raft + TLS, LAN listener, mlock on)
+      copy:
+        dest: /etc/vault.d/vault.hcl
+        owner: vault
+        group: vault
+        mode: '0640'
+        content: |
+          # managed by deploy_vault.yml — do not edit by hand
+          ui            = true
+          disable_mlock = false
+
+          storage "raft" {
+            path    = "/opt/vault/data"
+            node_id = "{{ vault_node_id }}"
+          }
+
+          listener "tcp" {
+            address         = "0.0.0.0:8200"
+            tls_cert_file   = "/opt/vault/tls/vault.crt"
+            tls_key_file    = "/opt/vault/tls/vault.key"
+            tls_min_version = "tls12"
+          }
+
+          api_addr     = "https://{{ vault_fqdn }}:8200"
+          cluster_addr = "https://{{ vault_addr_ip }}:8201"
+      notify: restart vault
+
+    - name: Enable and start Vault (will come up SEALED)
+      systemd:
+        name: vault
+        enabled: true
+        state: started
+
+    - name: Next steps
+      debug:
+        msg: >-
+          Vault установлен и запущен ЗАПЕЧАТАННЫМ на https://{{ vault_fqdn }}:8200
+          (IP {{ vault_addr_ip }}). Дальше — вручную по VAULT_RUNBOOK.md:
+          init -> сохранить unseal-ключи+root ОФЛАЙН -> unseal -> KV v2 -> политики -> AppRole.
+          Не забудь добавить запись {{ vault_fqdn }} -> {{ vault_addr_ip }} в локальный DNS-резолвер.
