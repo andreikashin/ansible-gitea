@@ -47,8 +47,26 @@
     state: directory
     owner: "999"
     group: "999"
-    mode: '0755'
     recurse: yes
+
+# Каталог данных postgres проверяется при старте: если права шире 0750, сервер
+# отказывается подниматься, а за ним ложатся core, jobservice и весь реестр.
+# Рекурсивный mode в задаче выше как раз ставил 0755 и укладывал harbor-db в
+# рестарт-луп после каждого прогона роли. Права на самих файлах postgres
+# выставляет себе сам, трогать их рекурсивно не нужно.
+- name: Check whether the PostgreSQL data directory exists
+  stat:
+    path: /data/database/pg14
+  register: harbor_pg_data
+
+- name: Keep the PostgreSQL data directory private
+  file:
+    path: /data/database/pg14
+    state: directory
+    owner: "999"
+    group: "999"
+    mode: '0700'
+  when: harbor_pg_data.stat.exists
 
 # === БЛОК 3: СКАЧИВАНИЕ И РАСПАКОВКА ===
 
