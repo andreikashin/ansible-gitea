@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+#
+# Конфиг агента lab-metrics. В норме тут нечего менять: агент сам определяет,
+# какой контроллер стоит в машине и какие пробы применимы. Файл существует для
+# переопределений на конкретной ноде.
+#
+# Единственный конфиг, который реально настраивают, живёт не здесь, а на
+# сервере мониторинга: это inventory ansible, из которого генерируются цели
+# Prometheus, правила алертов и доски Grafana.
+
+TEXTFILE_DIR={{ lab_metrics_textfile_dir }}
+PROBE_DIR={{ lab_metrics_probe_dir }}
+PROBE_TIMEOUT={{ lab_metrics_timeout }}
+{% if lab_metrics_extra_env %}
+
+{% for key, value in lab_metrics_extra_env.items() %}
+{{ key }}={{ value }}
+{% endfor %}
+{% endif %}

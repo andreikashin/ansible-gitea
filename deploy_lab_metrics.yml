@@ -1,0 +1,41 @@
+---
+# Раскатка агента метрик lab-metrics и node_exporter на ноды.
+#
+# Агент собирает то, что раньше приходилось смотреть руками: дефекты и
+# неисправленные ошибки дисков, состояние массива, кэша и батареи контроллера,
+# заполнение thin-пулов, запущенность гестов и время последнего успешного
+# vzdump. Раз в час, в файл textfile-коллектора, откуда его забирает Prometheus.
+#
+# Конфига у агента нет: он сам определяет драйвер контроллера и наличие
+# Proxmox. Один и тот же набор ставится и на HP-ноды, и на интеловскую машину
+# второй площадки, лишние пробы просто не активируются.
+#
+# Примеры:
+#   # все ноды Proxmox
+#   ansible-playbook deploy_lab_metrics.yml
+#   # одна нода
+#   ansible-playbook deploy_lab_metrics.yml -e lab_metrics_target=pve3
+#   # проверить, что изменится, ничего не трогая
+#   ansible-playbook deploy_lab_metrics.yml --check --diff
+#
+# Нацеливание через lab_metrics_target, а не --limit: --limit фильтрует все
+# play разом, что мешает добавить сюда позже отдельный play под сервер
+# мониторинга.
+
+- name: Deploy the lab metrics agent
+  hosts: "{{ lab_metrics_target | default('pve_all') }}"
+  become: true
+  gather_facts: true
+  vars:
+    ansible_remote_tmp: "/tmp/.ansible-{{ ansible_user | default('root') }}"
+  roles:
+    - lab_metrics
+
+  post_tasks:
+    - name: Show how to check the node by hand
+      debug:
+        msg:
+          - "Метрики: {{ lab_metrics_textfile_dir }}/lab.prom"
+          - "Прогнать вручную: {{ lab_metrics_bin }}"
+          - "Расписание: systemctl list-timers lab-metrics.timer"
+          - "Отдача экспортёра: curl -s localhost:{{ lab_metrics_node_exporter_port }}/metrics | grep '^lab_'"

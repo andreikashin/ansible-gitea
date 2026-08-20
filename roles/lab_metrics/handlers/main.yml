@@ -1,0 +1,10 @@
+---
+- name: Reload systemd
+  systemd:
+    daemon_reload: true
+
+- name: Restart node exporter
+  systemd:
+    name: prometheus-node-exporter
+    state: restarted
+  when: lab_metrics_install_node_exporter | bool

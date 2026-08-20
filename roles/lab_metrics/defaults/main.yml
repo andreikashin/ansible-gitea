@@ -1,0 +1,34 @@
+---
+# Откуда берётся код агента. Своей копии у роли нет: исходник живёт в
+# репозитории lab/metrics, роль только доставляет его на ноды. Когда появится
+# пакет, эти задачи заменит установка .deb, а переменная уйдёт.
+lab_metrics_src: "{{ playbook_dir }}/../lab-metrics"
+
+# Раскладка на ноде. Пути совпадают с тем, что положит deb-пакет, поэтому
+# переход на пакет ничего не двигает по файловой системе.
+lab_metrics_bin: /usr/bin/lab-metrics-collect
+lab_metrics_lib_dir: /usr/lib/lab-metrics
+lab_metrics_probe_dir: /usr/lib/lab-metrics/probes
+lab_metrics_config_dir: /etc/lab-metrics
+
+# Каталог textfile-коллектора. Значение по умолчанию совпадает с тем, что
+# использует пакет prometheus-node-exporter в Debian. Роль всё равно
+# прописывает его явно в /etc/default, чтобы агент и экспортёр не разъехались
+# при смене дистрибутива.
+lab_metrics_textfile_dir: /var/lib/prometheus/node-exporter
+
+# Расписание. Час это осознанный минимум: опрос дисков через контроллер стоит
+# десятков SCSI-команд, а дефекты и наработка меняются днями.
+lab_metrics_interval: 1h
+lab_metrics_on_boot_sec: 2min
+lab_metrics_splay: 5min
+lab_metrics_timeout: 120
+
+# Ставить ли node_exporter. Выключается, если на ноде он уже есть из другого
+# источника.
+lab_metrics_install_node_exporter: true
+lab_metrics_node_exporter_port: 9100
+
+# Дополнительные переменные в /etc/lab-metrics/config, если пробе нужен
+# нестандартный параметр на конкретной ноде.
+lab_metrics_extra_env: {}

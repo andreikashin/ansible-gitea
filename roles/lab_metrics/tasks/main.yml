@@ -1,0 +1,177 @@
+---
+# Раскатка агента метрик. Ставится одинаково на всё: HP-ноды, интеловскую
+# машину второй площадки, что угодно. Разница определяется в рантайме самим
+# агентом, а не переменными в инвентаре.
+
+- name: Install collector dependencies
+  apt:
+    name:
+      - smartmontools
+      - coreutils
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install node exporter
+  apt:
+    name: prometheus-node-exporter
+    state: present
+  when: lab_metrics_install_node_exporter | bool
+
+- name: Create directories
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+  loop:
+    - "{{ lab_metrics_lib_dir }}"
+    - "{{ lab_metrics_probe_dir }}"
+    - "{{ lab_metrics_config_dir }}"
+    - "{{ lab_metrics_textfile_dir }}"
+
+- name: Fail early when the agent checkout is missing
+  assert:
+    that: lab_metrics_src is defined and (lab_metrics_src ~ '/bin/lab-metrics-collect') is exists
+    fail_msg: >-
+      Не найден чекаут lab/metrics в {{ lab_metrics_src }}. Склонируй
+      https://gitea.v6rk.net/lab/metrics.git рядом с этим репозиторием или
+      задай lab_metrics_src.
+  run_once: true
+  delegate_to: localhost
+  become: false
+
+- name: Install shared probe helpers
+  copy:
+    src: "{{ lab_metrics_src }}/lib/lib.sh"
+    dest: "{{ lab_metrics_lib_dir }}/lib.sh"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install collector
+  copy:
+    src: "{{ lab_metrics_src }}/bin/lab-metrics-collect"
+    dest: "{{ lab_metrics_bin }}"
+    owner: root
+    group: root
+    mode: '0755'
+
+# Пробы кладутся все и всегда. Неприменимые молча не активируются: на
+# интеловской машине не найдётся драйвера hpsa, на не-Proxmox не найдётся
+# /etc/pve. Раскладывать разные наборы по типам нод не надо и вредно, потому
+# что тип ноды не предсказывает её контроллер.
+- name: Install probes
+  copy:
+    src: "{{ lab_metrics_src }}/probes/"
+    dest: "{{ lab_metrics_probe_dir }}/"
+    owner: root
+    group: root
+    mode: '0755'
+  notify: Reload systemd
+
+- name: Remove probes that are no longer shipped
+  block:
+    - name: List installed probes
+      find:
+        paths: "{{ lab_metrics_probe_dir }}"
+        file_type: file
+      register: lab_metrics_installed_probes
+
+    # Список берём с control-ноды: переименованная или удалённая проба иначе
+    # останется лежать на сервере и продолжит выполняться вечно.
+    - name: Delete stale probes
+      vars:
+        lab_metrics_shipped_probes: "{{ query('fileglob', lab_metrics_src + '/probes/*')
+                                        | map('basename') | list }}"
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ lab_metrics_installed_probes.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      when: (item.path | basename) not in lab_metrics_shipped_probes
+
+- name: Write agent config
+  template:
+    src: config.j2
+    dest: "{{ lab_metrics_config_dir }}/config"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Install systemd unit
+  copy:
+    src: "{{ lab_metrics_src }}/systemd/lab-metrics.service"
+    dest: /etc/systemd/system/lab-metrics.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+
+- name: Install systemd timer
+  copy:
+    src: "{{ lab_metrics_src }}/systemd/lab-metrics.timer"
+    dest: /etc/systemd/system/lab-metrics.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+
+# Пакет в Debian включает textfile-коллектор со своим путём. Прописываем путь
+# явно, иначе агент и экспортёр однажды разъедутся, и метрики будут собираться
+# в каталог, который никто не читает. Это ровно тот случай, когда всё выглядит
+# работающим, а данных нет.
+- name: Point node exporter at the textfile directory
+  lineinfile:
+    path: /etc/default/prometheus-node-exporter
+    regexp: '^ARGS='
+    line: 'ARGS="--collector.textfile.directory={{ lab_metrics_textfile_dir }}"'
+    create: true
+    owner: root
+    group: root
+    mode: '0644'
+  when: lab_metrics_install_node_exporter | bool
+  notify: Restart node exporter
+
+- name: Flush handlers before enabling the timer
+  meta: flush_handlers
+
+- name: Enable and start the timer
+  systemd:
+    name: lab-metrics.timer
+    enabled: true
+    state: started
+
+# Первый прогон делается сразу, а не через час: без него нода на час остаётся
+# без метрик и зажигает алерт дедмана на пустом месте.
+- name: Run the collector once now
+  command: "{{ lab_metrics_bin }}"
+  changed_when: true
+
+- name: Read back the generated metrics
+  slurp:
+    src: "{{ lab_metrics_textfile_dir }}/lab.prom"
+  register: lab_metrics_output
+
+- name: Verify the output is usable
+  vars:
+    lab_metrics_text: "{{ lab_metrics_output.content | b64decode }}"
+    lab_metrics_types: "{{ (lab_metrics_output.content | b64decode).split('\n')
+                           | select('match', '^# TYPE ') | list }}"
+  assert:
+    that:
+      - "'lab_metrics_last_run_timestamp_seconds{' in lab_metrics_text"
+      - lab_metrics_types | length == lab_metrics_types | unique | length
+    fail_msg: >-
+      Сборщик отработал, но вывод непригоден. Либо не записана метка времени
+      последнего прогона (тогда алерт дедмана не сработает никогда), либо в
+      файле продублировано объявление семейства, а на этом парсер Prometheus
+      роняет ВЕСЬ скрейп ноды, а не одну метрику.
+    quiet: true
+
+- name: Report which probes ran
+  debug:
+    msg: "{{ (lab_metrics_output.content | b64decode).split('\n')
+             | select('match', '^lab_metrics_probe_ok') | list }}"
