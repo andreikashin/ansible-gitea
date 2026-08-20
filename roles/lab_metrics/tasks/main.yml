@@ -35,9 +35,8 @@
   assert:
     that: lab_metrics_src is defined and (lab_metrics_src ~ '/bin/lab-metrics-collect') is exists
     fail_msg: >-
-      Не найден чекаут lab/metrics в {{ lab_metrics_src }}. Склонируй
-      https://gitea.v6rk.net/lab/metrics.git рядом с этим репозиторием или
-      задай lab_metrics_src.
+      Не найден чекаут репозитория с агентом в {{ lab_metrics_src }}.
+      Склонируй его рядом с этим репозиторием или задай lab_metrics_src.
   run_once: true
   delegate_to: localhost
   become: false
