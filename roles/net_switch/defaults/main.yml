@@ -1,0 +1,22 @@
+---
+# Префикс имён портов. На 2960X-48TS-L это первый (и единственный) стек-юнит.
+net_switch_port_prefix: "GigabitEthernet1/0/"
+
+# VTP transparent. Свитч бывший в употреблении: в режиме server или client он
+# может принять чужую базу VLAN по транку и переписать свою. Transparent
+# отключает эту механику совсем.
+net_switch_vtp_transparent: true
+
+# Писать ли startup-config после изменений. Без этого конфиг живёт до первой
+# перезагрузки.
+net_switch_save: true
+
+# Снимать ли running-config перед изменениями.
+net_switch_backup: true
+
+net_switch_bond:
+  enabled: false
+
+# Балансировка в port-channel. src-dst-ip даёт разложение по парам адресов;
+# один поток всё равно уедет в один линк, это свойство LACP, а не настройки.
+net_switch_bond_load_balance: src-dst-ip

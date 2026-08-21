@@ -1,0 +1,61 @@
+{#
+  Кандидат-конфиг для 2960X. ios_config разбирает его иерархически, сравнивает
+  с running-config и досылает только недостающие строки. Лишнее из running он
+  не удаляет: на бывшем в употреблении свитче это осознанно, чтобы плейбук не
+  снёс чего-то, о чём мы не знаем.
+
+  Здесь намеренно нет "no shutdown" для интерфейса Vlan: running-config его не
+  показывает, когда интерфейс поднят, и строка попадала бы в diff на каждом
+  прогоне. Состоянием интерфейса управляет отдельная задача роли.
+-#}
+{% if net_switch_vtp_transparent %}
+vtp mode transparent
+{% endif %}
+{% for seg in net_segments %}
+vlan {{ seg.vlan }}
+ name {{ seg.name }}
+{% endfor %}
+interface Vlan{{ net_switch_mgmt_vlan }}
+ description MANAGEMENT
+ ip address {{ net_switch_mgmt_address }} {{ net_switch_mgmt_netmask }}
+ip default-gateway {{ net_switch_default_gateway }}
+{% for group in net_switch_ports %}
+{% for n in range(group.first, group.last + 1) %}
+interface {{ net_switch_port_prefix }}{{ n }}
+ description {{ group.description }}
+{% if group.mode == 'trunk' %}
+ switchport mode trunk
+ switchport trunk native vlan {{ group.native | default(net_native_vlan) }}
+ switchport trunk allowed vlan {{ group.allowed | join(',') }}
+ switchport nonegotiate
+{% if group.portfast | default(true) %}
+ spanning-tree portfast trunk
+{% endif %}
+{% else %}
+ switchport mode access
+ switchport access vlan {{ group.vlan }}
+{% if group.portfast | default(true) %}
+ spanning-tree portfast
+{% endif %}
+{% endif %}
+{% endfor %}
+{% endfor %}
+{% if net_switch_bond.enabled | default(false) %}
+port-channel load-balance {{ net_switch_bond_load_balance }}
+{% for n in range(net_switch_bond.first, net_switch_bond.last + 1) %}
+interface {{ net_switch_port_prefix }}{{ n }}
+ description {{ net_switch_bond.description }}
+ switchport mode trunk
+ switchport trunk native vlan {{ net_switch_bond.native | default(net_native_vlan) }}
+ switchport trunk allowed vlan {{ net_switch_bond.allowed | join(',') }}
+ switchport nonegotiate
+ channel-protocol lacp
+ channel-group {{ net_switch_bond.id }} mode active
+{% endfor %}
+interface Port-channel{{ net_switch_bond.id }}
+ description {{ net_switch_bond.description }}
+ switchport mode trunk
+ switchport trunk native vlan {{ net_switch_bond.native | default(net_native_vlan) }}
+ switchport trunk allowed vlan {{ net_switch_bond.allowed | join(',') }}
+ spanning-tree portfast trunk
+{% endif %}

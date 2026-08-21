@@ -1,0 +1,74 @@
+---
+# Настройка Cisco 2960X. Только L2: VLAN, транки, access-порты, при желании
+# LACP. Один интерфейс Vlan существует ради управления самим свитчом.
+
+- name: Check the port layout
+  assert:
+    that:
+      - net_segments is defined and net_segments | length > 0
+      - net_switch_ports is defined and net_switch_ports | length > 0
+      - net_switch_ports | rejectattr('mode', 'in', ['trunk', 'access']) | list | length == 0
+      - net_switch_ports | selectattr('mode', 'equalto', 'trunk') | rejectattr('allowed', 'defined') | list | length == 0
+      - net_switch_ports | selectattr('mode', 'equalto', 'access') | rejectattr('vlan', 'defined') | list | length == 0
+    fail_msg: >-
+      Раскладка портов неполная. У транка должен быть список allowed,
+      у access-порта - vlan, режим только trunk или access.
+
+# VLAN, которые раздаются по портам, должны существовать в базе свитча. Проще
+# поймать опечатку здесь, чем ловить потом порт в несуществующем VLAN.
+- name: Check that every VLAN used on a port is declared
+  assert:
+    that: item in (net_segments | map(attribute='vlan') | list)
+    fail_msg: "VLAN {{ item }} стоит на порту, но его нет в net_segments"
+  loop: >-
+    {{ (net_switch_ports | selectattr('mode', 'equalto', 'access') | map(attribute='vlan') | list)
+       + (net_switch_ports | selectattr('mode', 'equalto', 'trunk') | map(attribute='allowed') | flatten | list) }}
+  loop_control:
+    label: "vlan {{ item }}"
+
+- name: Create the backup directory on the control node
+  file:
+    path: "{{ net_backup_dir }}"
+    state: directory
+    mode: '0700'
+  delegate_to: localhost
+  become: false
+  run_once: true
+  check_mode: false
+  when: net_switch_backup | bool
+
+- name: Read the running config
+  cisco.ios.ios_command:
+    commands: show running-config
+  register: net_switch_running
+  changed_when: false
+  check_mode: false
+  when: net_switch_backup | bool
+
+- name: Save the running config on the control node
+  copy:
+    content: "{{ net_switch_running.stdout[0] }}\n"
+    dest: "{{ net_backup_dir }}/{{ inventory_hostname }}-{{ net_switch_backup_stamp }}.cfg"
+    mode: '0600'
+  vars:
+    net_switch_backup_stamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+  delegate_to: localhost
+  become: false
+  check_mode: false
+  when: net_switch_backup | bool
+
+# Одна задача на весь конфиг: ios_config сам считает иерархический diff, так
+# что порты не превращаются в полсотни отдельных заходов на устройство.
+- name: Apply the switch configuration
+  cisco.ios.ios_config:
+    src: "{{ role_path }}/templates/switch.cfg.j2"
+    diff_against: running
+    save_when: "{{ 'changed' if net_switch_save | bool else 'never' }}"
+  register: net_switch_applied
+
+- name: Bring the management SVI up
+  cisco.ios.ios_interfaces:
+    config:
+      - name: "Vlan{{ net_switch_mgmt_vlan }}"
+        enabled: true
+    state: merged
