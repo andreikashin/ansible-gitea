@@ -1,0 +1,19 @@
+---
+# Файрвол ставится декларативно: плейбук владеет таблицами filter и nat
+# целиком. Всё, чего нет в шаблонах, удаляется - у правил RouterOS нет
+# устойчивого идентификатора, и различать "наше" и "чужое" не по чему.
+# Снимок прежнего состояния лежит в {{ net_backup_dir }}.
+
+- name: Apply the filter rules
+  community.routeros.api_modify:
+    path: ip firewall filter
+    data: "{{ lookup('template', 'firewall_filter.yml.j2') | from_yaml }}"
+    handle_absent_entries: remove
+    ensure_order: true
+
+- name: Apply the NAT rules
+  community.routeros.api_modify:
+    path: ip firewall nat
+    data: "{{ lookup('template', 'firewall_nat.yml.j2') | from_yaml }}"
+    handle_absent_entries: remove
+    ensure_order: true

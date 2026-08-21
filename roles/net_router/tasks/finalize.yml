@@ -1,0 +1,14 @@
+---
+# Последний шаг. До него мост работает как обычный свитч и старая плоская сеть
+# продолжает жить; после него кадры разбираются по VLAN.
+#
+# ⚠️ Именно здесь теряется доступ, если раскладка разъехалась. Управляющая
+# машина должна сидеть в native VLAN ({{ net_native_vlan }}), а под рукой
+# стоит держать winbox по MAC или консольный кабель.
+
+- name: Enable VLAN filtering on the bridge
+  community.routeros.api_modify:
+    path: interface bridge
+    data:
+      - name: "{{ net_router_bridge_name }}"
+        vlan-filtering: true

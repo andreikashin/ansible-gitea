@@ -1,0 +1,76 @@
+{#
+  Разворачивает карту сегментов в структуры, которые понимает api_modify.
+  Один файл на все списки: так видно целиком, что именно уедет на роутер.
+-#}
+{% set routed = net_segments | selectattr('router', 'defined') | selectattr('router') | list %}
+{% set dhcp_segments = routed | selectattr('dhcp', 'defined') | selectattr('dhcp') | list %}
+bridge_ports:
+{% for port in net_router_bridge_ports %}
+  - bridge: "{{ net_router_bridge_name }}"
+    interface: "{{ port }}"
+    pvid: {{ net_native_vlan }}
+    comment: "ansible: trunk"
+{% endfor %}
+
+bridge_vlans:
+{% for seg in routed %}
+{% if seg.vlan == net_native_vlan %}
+  - bridge: "{{ net_router_bridge_name }}"
+    vlan-ids: "{{ seg.vlan }}"
+    tagged: "{{ net_router_bridge_name }}"
+    untagged: "{{ net_router_bridge_ports | join(',') }}"
+    comment: "ansible: {{ seg.name }} (native)"
+{% else %}
+  - bridge: "{{ net_router_bridge_name }}"
+    vlan-ids: "{{ seg.vlan }}"
+    tagged: "{{ ([net_router_bridge_name] + net_router_bridge_ports) | join(',') }}"
+    comment: "ansible: {{ seg.name }}"
+{% endif %}
+{% endfor %}
+
+vlan_interfaces:
+{% for seg in routed %}
+  - name: "{{ net_router_vlan_iface_prefix }}{{ seg.vlan }}"
+    interface: "{{ net_router_bridge_name }}"
+    vlan-id: {{ seg.vlan }}
+    comment: "ansible: {{ seg.name }}"
+{% endfor %}
+
+addresses:
+{% for seg in routed %}
+  - address: "{{ seg.gateway }}/{{ seg.subnet.split('/')[1] }}"
+    interface: "{{ net_router_vlan_iface_prefix }}{{ seg.vlan }}"
+    comment: "ansible: {{ seg.name }}"
+{% endfor %}
+
+list_members:
+  - list: WAN
+    interface: "{{ net_router_wan_interface }}"
+    comment: "ansible: uplink"
+{% for seg in routed %}
+  - list: LAN
+    interface: "{{ net_router_vlan_iface_prefix }}{{ seg.vlan }}"
+    comment: "ansible: {{ seg.name }}"
+{% endfor %}
+
+pools:
+{% for seg in dhcp_segments %}
+  - name: "pool-{{ seg.name | lower }}"
+    ranges: "{{ seg.dhcp_pool }}"
+{% endfor %}
+
+dhcp_servers:
+{% for seg in dhcp_segments %}
+  - name: "dhcp-{{ seg.name | lower }}"
+    interface: "{{ net_router_vlan_iface_prefix }}{{ seg.vlan }}"
+    address-pool: "pool-{{ seg.name | lower }}"
+    lease-time: "{{ net_router_dhcp_lease_time }}"
+{% endfor %}
+
+dhcp_networks:
+{% for seg in dhcp_segments %}
+  - address: "{{ seg.subnet }}"
+    gateway: "{{ seg.gateway }}"
+    dns-server: "{{ net_dns_server }}"
+    comment: "ansible: {{ seg.name }}"
+{% endfor %}

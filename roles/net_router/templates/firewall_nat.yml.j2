@@ -1,0 +1,20 @@
+{#
+  Таблица nat целиком. Один masquerade наружу плюс пробросы из
+  net_router_port_forwards.
+-#}
+- chain: srcnat
+  action: masquerade
+  out-interface-list: WAN
+  comment: "ansible: masquerade to wan"
+
+{% for f in net_router_port_forwards %}
+- chain: dstnat
+  action: dst-nat
+  in-interface-list: WAN
+  protocol: {{ f.protocol }}
+  dst-port: "{{ f.port }}"
+  to-addresses: "{{ f.to_address }}"
+  to-ports: "{{ f.to_port | default(f.port) }}"
+  comment: "ansible: {{ f.comment }}"
+
+{% endfor %}

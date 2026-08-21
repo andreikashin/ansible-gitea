@@ -1,0 +1,80 @@
+---
+# MikroTik, RouterOS 7. Один мост с фильтрацией VLAN, L3-нога на каждый
+# маршрутизируемый сегмент, DHCP там, где он нужен, и файрвол по умолчанию
+# запрещающий всё, что не разрешено явно.
+
+net_router_bridge_name: bridge-lab
+net_router_vlan_iface_prefix: vlan
+net_router_identity: router
+
+# API по 8728 без TLS. В лабе это провод от управляющей машины до роутера
+# внутри доверенного сегмента; переключается на 8729 одной переменной.
+net_router_tls: false
+net_router_port: ~
+
+# Порты в мосту. Обычно только транк на свитч; добавь сюда свободные ether,
+# если захочешь воткнуть что-то напрямую в роутер.
+net_router_bridge_ports: "{{ [net_router_trunk_interface] }}"
+
+# Управлять ли WAN. Выключи, если снаружи PPPoE или статика от провайдера и
+# ты настраиваешь это руками.
+net_router_manage_wan: true
+
+# Управлять ли файрволом. Правила декларативные: плейбук владеет таблицами
+# filter и nat целиком и вычистит всё, чего нет в шаблонах.
+net_router_manage_firewall: true
+
+# Fasttrack. Политику он не ломает: первый пакет соединения проходит все
+# правила, ускоряются только последующие. Ломает он mangle, очереди и учёт
+# трафика, поэтому по умолчанию выключен - на гигабите в лабе он не нужен, а
+# отлаживать с ним неудобно.
+net_router_fasttrack: false
+
+# Финальный шаг: включить фильтрацию VLAN на мосту. До этого момента мост
+# работает как обычный свитч и старая плоская сеть продолжает жить.
+#
+# ⚠️ Это же и момент, когда можно отрезать себе доступ. Управляющая машина
+# должна сидеть в native VLAN, а под рукой стоит держать winbox по MAC
+# (/tool mac-server) или консольный кабель.
+net_router_enable_vlan_filtering: true
+
+net_router_dhcp_lease_time: 12h
+
+# Кому разрешено ходить между сегментами. from/to - имена из net_segments.
+# Всё, чего здесь нет, запрещено финальным drop.
+net_policy:
+  - from: CONSOLE
+    to: MGMT
+    comment: "джамп-хост в управление гипервизорами"
+  - from: CLIENTS
+    to: MGMT
+    comment: "рабочая станция в веб Proxmox"
+  - from: CLIENTS
+    to: SERVERS
+    comment: "рабочая станция в сервисы лабы"
+  - from: CONSOLE
+    to: SERVERS
+    comment: "джамп-хост в сервисы лабы"
+  - from: MGMT
+    to: SERVERS
+    comment: "ноды в бэкапы и сервисы лабы"
+
+# Кому разрешено наружу. DMZ здесь есть, а в net_policy его нет: почтовик
+# ходит в интернет и принимает проброшенный порт, но внутрь лабы не попадает.
+net_internet_segments: [MGMT, SERVERS, CONSOLE, DMZ, CLIENTS]
+
+# Что снимать в бэкап перед изменениями.
+net_router_backup_paths:
+  - interface bridge
+  - interface bridge port
+  - interface bridge vlan
+  - interface vlan
+  - interface list
+  - interface list member
+  - ip address
+  - ip pool
+  - ip dhcp-server
+  - ip dhcp-server network
+  - ip dns
+  - ip firewall filter
+  - ip firewall nat

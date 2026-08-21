@@ -1,0 +1,96 @@
+{#
+  Таблица filter целиком. Порядок значим: RouterOS идёт сверху вниз, а
+  api_modify с ensure_order выстраивает правила ровно так, как здесь.
+  Политика по умолчанию запрещающая - обе цепочки заканчиваются drop.
+-#}
+{% set routed = net_segments | selectattr('router', 'defined') | selectattr('router') | list %}
+{% set dhcp_segments = routed | selectattr('dhcp', 'defined') | selectattr('dhcp') | list %}
+{% macro iface(name) %}{{ net_router_vlan_iface_prefix }}{{ (net_segments | selectattr('name', 'equalto', name) | first).vlan }}{% endmacro %}
+# --- input: доступ к самому роутеру ---
+- chain: input
+  action: accept
+  connection-state: "established,related,untracked"
+  comment: "ansible: input established"
+
+- chain: input
+  action: drop
+  connection-state: "invalid"
+  comment: "ansible: input invalid"
+
+- chain: input
+  action: accept
+  protocol: icmp
+  in-interface-list: LAN
+  comment: "ansible: input icmp from lan"
+
+{% for vlan in net_router_mgmt_vlans %}
+- chain: input
+  action: accept
+  in-interface: "{{ net_router_vlan_iface_prefix }}{{ vlan }}"
+  comment: "ansible: management from vlan {{ vlan }}"
+
+{% endfor %}
+{% for seg in dhcp_segments %}
+- chain: input
+  action: accept
+  protocol: udp
+  dst-port: "67"
+  in-interface: "{{ net_router_vlan_iface_prefix }}{{ seg.vlan }}"
+  comment: "ansible: dhcp {{ seg.name }}"
+
+{% endfor %}
+- chain: input
+  action: drop
+  comment: "ansible: input drop the rest"
+
+# --- forward: движение между сегментами ---
+{% if net_router_fasttrack %}
+- chain: forward
+  action: fasttrack-connection
+  connection-state: "established,related"
+  comment: "ansible: fasttrack"
+
+{% endif %}
+- chain: forward
+  action: accept
+  connection-state: "established,related,untracked"
+  comment: "ansible: forward established"
+
+- chain: forward
+  action: drop
+  connection-state: "invalid"
+  comment: "ansible: forward invalid"
+
+{# DNS всей лабы стоит на OPNsense в SERVERS, значит до него нужен доступ из
+   любого сегмента, включая DMZ. Разрешаем ровно 53-й порт и ровно этот
+   адрес, а не сегмент целиком. #}
+{% for proto in ['udp', 'tcp'] %}
+- chain: forward
+  action: accept
+  protocol: {{ proto }}
+  dst-address: "{{ net_dns_server }}"
+  dst-port: "53"
+  comment: "ansible: dns {{ proto }} for every segment"
+
+{% endfor %}
+{% for p in net_policy %}
+- chain: forward
+  action: accept
+  in-interface: "{{ iface(p.from) }}"
+  out-interface: "{{ iface(p.to) }}"
+  comment: "ansible: {{ p.from }} -> {{ p.to }}{{ ' (' ~ p.comment ~ ')' if p.comment is defined else '' }}"
+
+{% endfor %}
+{% for name in net_internet_segments %}
+- chain: forward
+  action: accept
+  in-interface: "{{ iface(name) }}"
+  out-interface-list: WAN
+  comment: "ansible: {{ name }} -> internet"
+
+{% endfor %}
+{# Явного запрета DMZ внутрь лабы здесь нет и не нужно: его нет в net_policy,
+   значит его ловит финальный drop. #}
+- chain: forward
+  action: drop
+  comment: "ansible: forward drop the rest"

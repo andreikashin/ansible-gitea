@@ -1,0 +1,159 @@
+---
+# Настройка MikroTik. Порядок задач подобран так, чтобы не отрезать себе
+# доступ: сначала мост и VLAN, потом адреса и сервисы, потом файрвол, и лишь
+# в самом конце включается фильтрация VLAN на мосту.
+
+- name: Check the network map
+  assert:
+    that:
+      - net_segments is defined and net_segments | length > 0
+      - net_native_vlan in (net_segments | map(attribute='vlan') | list)
+      - net_router_wan_interface is defined
+      - net_router_trunk_interface is defined
+      - net_router_bridge_ports | length > 0
+      - net_segments | selectattr('router', 'defined') | selectattr('router') | rejectattr('gateway', 'defined') | list | length == 0
+      - net_segments | selectattr('dhcp', 'defined') | selectattr('dhcp') | rejectattr('dhcp_pool', 'defined') | list | length == 0
+    fail_msg: >-
+      Карта сети неполная. У маршрутизируемого сегмента должен быть gateway,
+      у сегмента с DHCP - dhcp_pool, а net_native_vlan обязан существовать
+      среди сегментов.
+
+# Имена в net_policy должны существовать: опечатка тут превращается в тихо
+# отсутствующее правило.
+- name: Check that the policy refers to existing segments
+  assert:
+    that: item in (net_segments | map(attribute='name') | list)
+    fail_msg: "В net_policy или net_internet_segments упомянут сегмент {{ item }}, которого нет в net_segments"
+  loop: >-
+    {{ (net_policy | map(attribute='from') | list)
+       + (net_policy | map(attribute='to') | list)
+       + net_internet_segments }}
+  loop_control:
+    label: "{{ item }}"
+
+- name: Build the RouterOS data model
+  set_fact:
+    net_r: "{{ lookup('template', 'router_data.yml.j2') | from_yaml }}"
+
+- name: Create the backup directory on the control node
+  file:
+    path: "{{ net_backup_dir }}"
+    state: directory
+    mode: '0700'
+  become: false
+  check_mode: false
+
+# Снимок того, что было. api_info отдаёт ровно те структуры, которые понимает
+# api_modify, так что откатиться можно тем же модулем.
+- name: Read the current configuration
+  community.routeros.api_info:
+    path: "{{ item }}"
+  loop: "{{ net_router_backup_paths }}"
+  register: net_router_before
+  changed_when: false
+  check_mode: false
+
+- name: Save the current configuration on the control node
+  copy:
+    content: "{{ dict(net_router_backup_paths | zip(net_router_before.results | map(attribute='result') | list)) | to_nice_json }}\n"
+    dest: "{{ net_backup_dir }}/{{ inventory_hostname }}-{{ net_router_backup_stamp }}.json"
+    mode: '0600'
+  vars:
+    net_router_backup_stamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+  become: false
+  check_mode: false
+
+- name: Set the identity
+  community.routeros.api_modify:
+    path: system identity
+    data:
+      - name: "{{ net_router_identity }}"
+
+# vlan-filtering здесь сознательно не указан: пока мост создаётся, он должен
+# оставаться обычным свитчом. Включается в самом конце, отдельной задачей.
+- name: Ensure the bridge exists
+  community.routeros.api_modify:
+    path: interface bridge
+    data:
+      - name: "{{ net_router_bridge_name }}"
+        comment: "ansible: lab bridge"
+
+- name: Put the trunk into the bridge
+  community.routeros.api_modify:
+    path: interface bridge port
+    data: "{{ net_r.bridge_ports }}"
+
+- name: Declare VLANs on the bridge
+  community.routeros.api_modify:
+    path: interface bridge vlan
+    data: "{{ net_r.bridge_vlans }}"
+
+- name: Create the routed legs
+  community.routeros.api_modify:
+    path: interface vlan
+    data: "{{ net_r.vlan_interfaces }}"
+
+- name: Assign gateway addresses
+  community.routeros.api_modify:
+    path: ip address
+    data: "{{ net_r.addresses }}"
+
+- name: Create the interface lists
+  community.routeros.api_modify:
+    path: interface list
+    data:
+      - name: WAN
+        comment: "ansible: uplink"
+      - name: LAN
+        comment: "ansible: routed segments"
+
+- name: Fill the interface lists
+  community.routeros.api_modify:
+    path: interface list member
+    data: "{{ net_r.list_members }}"
+
+# DNS отдаёт OPNsense, роутер сам резолвером не работает: allow-remote-requests
+# выключен намеренно.
+- name: Point the router at the lab resolver
+  community.routeros.api_modify:
+    path: ip dns
+    data:
+      - servers: "{{ net_dns_server }}"
+        allow-remote-requests: false
+
+- name: Take the uplink address from the provider
+  community.routeros.api_modify:
+    path: ip dhcp-client
+    data:
+      - interface: "{{ net_router_wan_interface }}"
+        add-default-route: true
+        use-peer-dns: false
+        disabled: false
+        comment: "ansible: wan"
+  when: net_router_manage_wan | bool
+
+- name: Create the DHCP pools
+  community.routeros.api_modify:
+    path: ip pool
+    data: "{{ net_r.pools | default([], true) }}"
+  when: net_r.pools | default([], true) | length > 0
+
+- name: Create the DHCP servers
+  community.routeros.api_modify:
+    path: ip dhcp-server
+    data: "{{ net_r.dhcp_servers | default([], true) }}"
+  when: net_r.dhcp_servers | default([], true) | length > 0
+
+- name: Describe the DHCP networks
+  community.routeros.api_modify:
+    path: ip dhcp-server network
+    data: "{{ net_r.dhcp_networks | default([], true) }}"
+  when: net_r.dhcp_networks | default([], true) | length > 0
+
+- name: Configure the firewall
+  include_tasks: firewall.yml
+  when: net_router_manage_firewall | bool
+
+- name: Turn VLAN filtering on
+  include_tasks: finalize.yml
+  when: net_router_enable_vlan_filtering | bool
