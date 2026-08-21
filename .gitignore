@@ -3,6 +3,7 @@
 host_vars/*
 !host_vars/*.template
 secrets.yml
+group_vars/network_group.yml
 secrets.yaml
 *.crt
 *.key

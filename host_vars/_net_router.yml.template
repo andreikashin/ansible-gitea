@@ -1,0 +1,32 @@
+---
+# Шаблон для host_vars/net_router.yml (тот в .gitignore).
+# MikroTik, RouterOS 7. Модули community.routeros ходят по API с управляющей
+# машины, поэтому подключение к самому хосту - local. Логин и пароль берутся
+# из secrets.yml, здесь только адреса и имена интерфейсов.
+
+ansible_connection: local
+
+net_router_host: 198.18.20.1
+net_router_user: "{{ router_admin_login }}"
+net_router_password: "{{ router_admin_password }}"
+
+# ether1 наружу, ether2 транком в Gi1/0/1 свитча. Остальные порты свободны.
+net_router_wan_interface: ether1
+net_router_trunk_interface: ether2
+
+# Кто имеет право стучаться в сам роутер (winbox, ssh, api). Остальное в
+# chain=input отбрасывается.
+#
+# ⚠️ Native VLAN здесь держится намеренно, пока рабочая станция ещё в старой
+# плоской сети: без него применение файрвола отрежет управляющую машину от
+# роутера в тот же момент, когда правила встанут. Убрать 20 из списка можно
+# после того, как станция переедет в CLIENTS.
+net_router_mgmt_vlans: [20, 30, 99]
+
+# Проброс портов снаружи. Пусто - ничего не пробрасывается.
+# Пример:
+#   - comment: "SMTP в DMZ"
+#     protocol: tcp
+#     port: 25
+#     to_address: 198.18.50.10
+net_router_port_forwards: []

@@ -1,0 +1,61 @@
+---
+# Шаблон для host_vars/net_switch.yml (тот в .gitignore).
+# Логины и пароли берутся из secrets.yml, здесь только адреса и порты.
+
+ansible_host: 198.18.20.2
+ansible_connection: ansible.netcommon.network_cli
+ansible_network_os: cisco.ios.ios
+ansible_user: "{{ switch_admin_login }}"
+ansible_password: "{{ switch_admin_password }}"
+ansible_become: true
+ansible_become_method: enable
+ansible_become_password: "{{ switch_enable_password }}"
+
+net_switch_mgmt_vlan: 20
+net_switch_mgmt_address: 198.18.20.2
+net_switch_mgmt_netmask: 255.255.255.0
+net_switch_default_gateway: 198.18.20.1
+
+# first/last - границы диапазона портов, оба конца включительно.
+# mode: trunk требует allowed (список VLAN), mode: access требует vlan.
+# native по умолчанию берётся из net_native_vlan.
+net_switch_ports:
+  - first: 1
+    last: 1
+    description: UPLINK-ROUTER
+    mode: trunk
+    allowed: [10, 20, 30, 50, 99]
+    portfast: false
+
+  - first: 2
+    last: 8
+    description: PVE-HOSTS
+    mode: trunk
+    allowed: [20, 50]
+
+  - first: 20
+    last: 30
+    description: ILO-AND-CONSOLE-CABLE
+    mode: access
+    vlan: 2
+
+  - first: 40
+    last: 47
+    description: CLIENTS
+    mode: access
+    vlan: 99
+
+  - first: 48
+    last: 48
+    description: WIFI-AP
+    mode: trunk
+    allowed: [30, 99]
+    native: 99
+
+net_switch_bond:
+  enabled: false
+  id: 1
+  first: 9
+  last: 12
+  description: NODE-BOND
+  allowed: [20, 50]
