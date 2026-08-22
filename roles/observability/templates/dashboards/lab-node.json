@@ -1,0 +1,223 @@
+{
+  "uid": "lab-node",
+  "title": "Нода, подробности",
+  "tags": [
+    "lab"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "time": {
+    "from": "now-30d",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "node",
+        "label": "Нода",
+        "type": "query",
+        "query": "label_values(lab_metrics_last_run_timestamp_seconds, node)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {},
+        "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Неисправленные ошибки чтения",
+      "id": 1,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_disk_uncorrected_errors{node=\"$node\"}",
+          "legendFormat": "{{serial}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Переназначенные блоки",
+      "id": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_disk_grown_defects{node=\"$node\"}",
+          "legendFormat": "{{serial}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Температура дисков",
+      "id": 3,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          },
+          "unit": "celsius"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_disk_temperature_celsius{node=\"$node\"}",
+          "legendFormat": "{{serial}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Заполнение thin-пулов",
+      "id": 4,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          },
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_lvm_thinpool_data_percent{node=\"$node\"}",
+          "legendFormat": "{{vg}}/{{pool}} данные"
+        },
+        {
+          "refId": "B",
+          "expr": "lab_lvm_thinpool_meta_percent{node=\"$node\"}",
+          "legendFormat": "{{vg}}/{{pool}} метаданные"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Часов с последнего успешного бэкапа",
+      "id": 5,
+      "gridPos": {
+        "h": 5,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 26
+              },
+              {
+                "color": "red",
+                "value": 72
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(time() - lab_backup_last_success_timestamp_seconds{node=\"$node\"}) / 3600",
+          "legendFormat": "VMID {{vmid}}"
+        }
+      ]
+    }
+  ]
+}
