@@ -1,0 +1,252 @@
+---
+# Восстановление ВМ и контейнеров из локального бэкапа на Proxmox-ноду.
+#
+# Обратная операция к backup_proxmox_vms.yml. Берёт архивы vzdump из
+# {{ proxmox_backup_host_dir }} на control-ноде, кладёт их на целевую ноду и
+# разворачивает через qmrestore (QEMU) или pct restore (LXC).
+#
+# Зачем отдельно от clone_proxmox_node.yml: тот переносит ноду на ноду и всегда
+# снимает свежий vzdump с ЖИВОГО источника. После пересборки массива и
+# переустановки источника уже нет, восстанавливать надо из архивов на диске.
+#
+# ПО УМОЛЧАНИЮ НИЧЕГО НЕ ПИШЕТ. Прогон без параметров это проверка: показывает,
+# что нашлось, что будет восстановлено и куда, но не трогает ноду. Чтобы
+# применить, нужен явный -e restore_apply=true.
+#
+# Существующий гест НЕ перезаписывается: если VMID уже занят, он пропускается.
+# Снять защиту можно -e restore_force=true, и это единственный способ потерять
+# данные этим плейбуком, поэтому флаг отдельный от restore_apply.
+#
+# Нацеливание через proxmox_target, а НЕ через --limit: --limit фильтрует все
+# play разом, включая первый (localhost), и проверка rsync молча не выполнится.
+#
+# Основные переменные:
+#   proxmox_target        - нода назначения (обязательно)
+#   restore_source_dir    - каталог с архивами; пусто = бэкап целевой ноды.
+#                           Задавать явно, когда восстанавливаешь бэкап ОДНОЙ ноды
+#                           на ДРУГУЮ (временный перенос гестов на свободный хост).
+#   restore_apply         - false (проверка) / true (писать на ноду)
+#   restore_storage       - хранилище для дисков, по умолчанию local-lvm
+#   restore_vm_ids        - список VMID; пусто = все, что найдены в бэкапе
+#   restore_force         - перезаписать существующий VMID (опасно)
+#   restore_template_vmids - какие VMID после восстановления пометить шаблонами
+#   restore_start_after   - запустить гесты после восстановления (по умолчанию нет)
+#
+# Примеры:
+#   # что будет сделано, без изменений
+#   ansible-playbook restore_proxmox_guests.yml -e proxmox_target=pve3
+#   # восстановить всё
+#   ansible-playbook restore_proxmox_guests.yml -e proxmox_target=pve3 -e restore_apply=true
+#   # только два геста, с пометкой шаблонов
+#   ansible-playbook restore_proxmox_guests.yml -e proxmox_target=pve3 -e restore_apply=true \
+#     -e '{"restore_vm_ids":[130,900],"restore_template_vmids":[900]}'
+#   # бэкап одной ноды развернуть на другой (временный перенос)
+#   ansible-playbook restore_proxmox_guests.yml -e proxmox_target=pve2 -e restore_apply=true \
+#     -e restore_source_dir=/mnt/d/backup/pve3 -e '{"restore_vm_ids":[130,131,132,200]}'
+
+- name: Check rsync on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check rsync on control node
+      command: rsync --version
+      register: restore_rsync_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if rsync is missing on control node
+      fail:
+        msg: >-
+          rsync is required on the control node to copy archives back.
+          Install it before rerunning, for example: sudo apt install rsync
+      when: restore_rsync_check.rc != 0
+
+- name: Restore Proxmox guests from local backup
+  hosts: "{{ proxmox_target | default('pve_group') }}"
+  gather_facts: false
+  vars:
+    proxmox_ssh_user: "{{ ansible_user | default('root') }}"
+    ansible_remote_tmp: "/tmp/.ansible-{{ proxmox_ssh_user }}"
+    restore_apply: false
+    restore_force: false
+    restore_storage: local-lvm
+    restore_vm_ids: []
+    restore_template_vmids: []
+    restore_start_after: false
+    # Пусто = взять каталог бэкапа целевой ноды. Непусто = явный источник,
+    # что нужно при восстановлении бэкапа одной ноды на другую.
+    restore_source_dir: ""
+    # Каталог на ноде, куда кладём архив перед разворачиванием. Чистится после.
+    restore_stage_dir: /var/lib/vz/dump
+
+  tasks:
+    # Разделено на две задачи, а не тернарником: обращение к
+    # proxmox_backup_host_dir тянет за собой proxmox_backup_local_dir, которого
+    # у чужой ноды может не быть вовсе.
+    - name: Use the explicitly given source directory
+      set_fact:
+        rg_src_dir: "{{ restore_source_dir }}"
+      when: restore_source_dir | length > 0
+      changed_when: false
+
+    - name: Otherwise default to this node's own backup folder
+      set_fact:
+        rg_src_dir: "{{ proxmox_backup_host_dir }}"
+      when: restore_source_dir | length == 0
+      changed_when: false
+
+    - name: Ensure a source directory could be resolved
+      assert:
+        that:
+          - rg_src_dir is defined
+          - rg_src_dir | length > 0
+        fail_msg: >-
+          Source directory is not resolved for {{ inventory_hostname }}.
+          Either set proxmox_backup_local_dir in host_vars/{{ inventory_hostname }}.yml,
+          or pass -e restore_source_dir=/path/to/backup when restoring another
+          node's backup onto this one.
+        quiet: true
+
+    - name: Find vzdump archives in the local backup directory
+      find:
+        paths: "{{ rg_src_dir }}"
+        patterns:
+          - "vzdump-qemu-*.vma.zst"
+          - "vzdump-qemu-*.vma.lzo"
+          - "vzdump-qemu-*.vma.gz"
+          - "vzdump-lxc-*.tar.zst"
+          - "vzdump-lxc-*.tar.lzo"
+          - "vzdump-lxc-*.tar.gz"
+        file_type: file
+      delegate_to: localhost
+      become: false
+      register: restore_found
+
+    - name: Fail early if the backup directory has no archives
+      assert:
+        that: restore_found.files | length > 0
+        fail_msg: >-
+          No vzdump archives found in {{ rg_src_dir }}.
+          Check proxmox_backup_folder_name and that the backup actually ran.
+        quiet: true
+
+    # Из имени файла достаём тип и VMID: vzdump-<qemu|lxc>-<vmid>-<дата>.<ext>
+    - name: Parse archives into (vmid, type, path, mtime)
+      set_fact:
+        restore_candidates: >-
+          {{ restore_found.files
+             | map('combine', {}) | list
+             | map(attribute='path') | list
+             | zip(restore_found.files | map(attribute='mtime') | list)
+             | map('list') | list }}
+      changed_when: false
+
+    - name: Build a structured archive list
+      set_fact:
+        restore_archives: >-
+          {{ restore_archives | default([]) + [{
+               'path': item[0],
+               'mtime': item[1],
+               'type': (item[0] | basename | regex_replace('^vzdump-(qemu|lxc)-.*$', '\1')),
+               'vmid': (item[0] | basename | regex_replace('^vzdump-(?:qemu|lxc)-([0-9]+)-.*$', '\1') | int)
+             }] }}
+      loop: "{{ restore_candidates }}"
+      loop_control:
+        label: "{{ item[0] | basename }}"
+      changed_when: false
+
+    # На один VMID архивов может быть несколько (разные даты). Берём свежий.
+    - name: Keep only the newest archive per VMID
+      set_fact:
+        restore_selected: >-
+          {{ restore_archives
+             | sort(attribute='mtime')
+             | groupby('vmid')
+             | map(attribute='1')
+             | map('last')
+             | list }}
+      changed_when: false
+
+    - name: Apply the VMID filter when one is given
+      set_fact:
+        restore_selected: >-
+          {{ restore_selected
+             if (restore_vm_ids | length == 0)
+             else (restore_selected | selectattr('vmid', 'in', restore_vm_ids | map('int') | list) | list) }}
+      changed_when: false
+
+    - name: Fail if the requested VMIDs are not in the backup
+      assert:
+        that: restore_selected | length > 0
+        fail_msg: >-
+          None of the requested VMIDs {{ restore_vm_ids }} were found in
+          {{ rg_src_dir }}.
+        quiet: true
+      when: restore_vm_ids | length > 0
+
+    - name: Check which VMIDs already exist on the node
+      stat:
+        path: "{{ '/etc/pve/qemu-server/' ~ item.vmid ~ '.conf' if item.type == 'qemu' else '/etc/pve/lxc/' ~ item.vmid ~ '.conf' }}"
+      loop: "{{ restore_selected }}"
+      loop_control:
+        label: "{{ item.type }} {{ item.vmid }}"
+      register: restore_existing
+      changed_when: false
+
+    - name: Split into restorable and skipped
+      set_fact:
+        restore_plan: >-
+          {{ restore_existing.results
+             | rejectattr('stat.exists')
+             | map(attribute='item') | list }}
+        restore_skipped: >-
+          {{ restore_existing.results
+             | selectattr('stat.exists')
+             | map(attribute='item') | list }}
+      changed_when: false
+
+    # restore_force переводит занятые VMID из "пропустить" в "перезаписать".
+    - name: Fold occupied VMIDs back in when force is requested
+      set_fact:
+        restore_plan: "{{ restore_plan + restore_skipped }}"
+        restore_skipped: []
+      when: restore_force | bool
+
+    - name: Report the plan
+      debug:
+        msg: >-
+          {{ 'DRY RUN, ничего не пишется. Для применения добавь -e restore_apply=true.'
+             if not (restore_apply | bool) else 'ПРИМЕНЯЕТСЯ.' }}
+          Источник: {{ rg_src_dir }}.
+          Восстановить на {{ inventory_hostname }} в {{ restore_storage }}:
+          {{ restore_plan | map(attribute='vmid') | list | sort | join(', ') | default('нет', true) }}.
+          Пропустить (VMID уже занят): {{ restore_skipped | map(attribute='vmid') | list | sort | join(', ') | default('нет', true) }}.
+          {{ 'ВНИМАНИЕ: restore_force=true, занятые VMID будут перезаписаны.' if (restore_force | bool) else '' }}
+
+    - name: Stop here when this is a dry run
+      meta: end_host
+      when: not (restore_apply | bool)
+
+    - name: Ensure the staging directory exists on the node
+      file:
+        path: "{{ restore_stage_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Restore each guest sequentially
+      include_tasks: restore_proxmox_guest_item.yml
+      loop: "{{ restore_plan }}"
+      loop_control:
+        loop_var: restore_guest
+        label: "{{ restore_guest.type }} {{ restore_guest.vmid }}"
+
+    - name: Report result
+      debug:
+        msg: >-
+          Восстановление на {{ inventory_hostname }} завершено.
+          Успешно: {{ (restore_plan | map(attribute='vmid') | list | difference(restore_failed | default([]))) | sort | join(', ') | default('нет', true) }}.
+          С ошибкой: {{ (restore_failed | default([])) | sort | join(', ') | default('нет', true) }}.
+          Пропущено: {{ restore_skipped | map(attribute='vmid') | list | sort | join(', ') | default('нет', true) }}.
+          Дальше: проверь сеть гестов и, если нужно, верни ISO через
+          restore_proxmox_template_files.yml.

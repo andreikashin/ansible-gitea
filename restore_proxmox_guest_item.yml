@@ -1,0 +1,138 @@
+---
+# Восстановление одного геста. Подключается из restore_proxmox_guests.yml
+# через include_tasks, работает с restore_guest (path, type, vmid).
+#
+# Блок с rescue: отказ на одном госте не должен ронять весь прогон, иначе
+# после переустановки ноды один битый архив остановит восстановление остальных.
+
+- name: "Restore {{ restore_guest.type }} {{ restore_guest.vmid }}"
+  block:
+    - name: Set per-guest facts
+      set_fact:
+        rg_remote_archive: "{{ restore_stage_dir }}/{{ restore_guest.path | basename }}"
+        rg_is_template: "{{ (restore_guest.vmid | int) in (restore_template_vmids | map('int') | list) }}"
+      changed_when: false
+
+    - name: Prepare rsync transfer settings
+      set_fact:
+        rg_ssh_key: >-
+          {{ (hostvars[inventory_hostname].ansible_ssh_private_key_file | default('~/.ssh/id_rsa'))
+             | regex_replace('^~', lookup('env', 'HOME')) }}
+        rg_remote_user: "{{ proxmox_ssh_user }}"
+        rg_remote_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+      changed_when: false
+
+    - name: Build the rsync ssh command
+      set_fact:
+        rg_ssh_command: >-
+          ssh -i {{ rg_ssh_key }}
+          -p {{ hostvars[inventory_hostname].ansible_port | default(hostvars[inventory_hostname].ansible_ssh_port | default(22)) }}
+          -o ConnectTimeout=15
+          -o BatchMode=yes
+          -o ServerAliveInterval=15
+          -o ServerAliveCountMax=4
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+      changed_when: false
+
+    # Push с control-ноды на Proxmox. Канал до нод рвётся на больших передачах,
+    # поэтому повторы обязательны, а --append-verify досылает остаток вместо
+    # того чтобы начинать многогигабайтный архив заново. Безопасно: имя архива
+    # vzdump содержит дату, файл на источнике неизменен, спутать нечего.
+    - name: "Copy archive for {{ restore_guest.vmid }} to the node"
+      shell: >-
+        set -o pipefail;
+        rsync
+        --archive
+        --append-verify
+        --partial
+        --human-readable
+        --protect-args
+        --timeout=600
+        -e {{ rg_ssh_command | quote }}
+        {{ restore_guest.path | quote }}
+        {{ (rg_remote_user ~ '@' ~ rg_remote_host ~ ':' ~ rg_remote_archive) | quote }}
+      args:
+        executable: /bin/bash
+      delegate_to: localhost
+      become: false
+      register: rg_copy
+      until: rg_copy.rc == 0
+      retries: 5
+      delay: 10
+
+    # Существующий гест сносим только когда явно попросили restore_force.
+    # qmrestore/pct restore c --force сами перезапишут конфиг, но диски старого
+    # геста при этом останутся мусором, поэтому убираем его целиком.
+    - name: "Destroy existing guest {{ restore_guest.vmid }} before overwrite"
+      command: >-
+        {{ 'qm destroy ' ~ restore_guest.vmid ~ ' --purge'
+           if restore_guest.type == 'qemu'
+           else 'pct destroy ' ~ restore_guest.vmid ~ ' --purge' }}
+      when: restore_force | bool
+      register: rg_destroy
+      failed_when:
+        - rg_destroy.rc != 0
+        - "'does not exist' not in (rg_destroy.stderr | default(''))"
+      changed_when: rg_destroy.rc == 0
+
+    - name: "Restore QEMU VM {{ restore_guest.vmid }}"
+      command: >-
+        qmrestore {{ rg_remote_archive }} {{ restore_guest.vmid }}
+        --storage {{ restore_storage }}
+      when: restore_guest.type == 'qemu'
+      register: rg_qmrestore
+      changed_when: rg_qmrestore.rc == 0
+
+    - name: "Restore LXC container {{ restore_guest.vmid }}"
+      command: >-
+        pct restore {{ restore_guest.vmid }} {{ rg_remote_archive }}
+        --storage {{ restore_storage }}
+      when: restore_guest.type == 'lxc'
+      register: rg_pctrestore
+      changed_when: rg_pctrestore.rc == 0
+
+    # vzdump не сохраняет признак шаблона: восстановленный шаблон приходит
+    # обычной ВМ. Возвращаем флаг по явному списку restore_template_vmids.
+    - name: "Convert {{ restore_guest.vmid }} back into a template"
+      command: "qm template {{ restore_guest.vmid }}"
+      when:
+        - rg_is_template | bool
+        - restore_guest.type == 'qemu'
+      register: rg_template
+      changed_when: rg_template.rc == 0
+
+    - name: "Start guest {{ restore_guest.vmid }}"
+      command: >-
+        {{ 'qm start ' ~ restore_guest.vmid
+           if restore_guest.type == 'qemu'
+           else 'pct start ' ~ restore_guest.vmid }}
+      when:
+        - restore_start_after | bool
+        - not (rg_is_template | bool)
+      register: rg_start
+      changed_when: rg_start.rc == 0
+
+    - name: "Remove the staged archive for {{ restore_guest.vmid }}"
+      file:
+        path: "{{ rg_remote_archive }}"
+        state: absent
+
+  rescue:
+    - name: "Record the failure for {{ restore_guest.vmid }}"
+      set_fact:
+        restore_failed: "{{ (restore_failed | default([])) + [restore_guest.vmid] }}"
+      changed_when: false
+
+    - name: "Clean up the staged archive after a failed restore"
+      file:
+        path: "{{ rg_remote_archive | default('') }}"
+        state: absent
+      when: (rg_remote_archive | default('')) | length > 0
+
+    - name: "Report the failure for {{ restore_guest.vmid }}"
+      debug:
+        msg: >-
+          Восстановление {{ restore_guest.type }} {{ restore_guest.vmid }} не удалось.
+          Остальные гесты обрабатываются дальше. Архив:
+          {{ restore_guest.path | basename }}.
