@@ -1,0 +1,56 @@
+# {{ ansible_managed }}
+#
+# Доставка наружу пока не настроена сознательно: алерты смотрим в уголке
+# лаб-дашборда, который читает /api/v2/alerts отсюда. Alertmanager всё равно
+# нужен и стоит в цепочке с самого начала, потому что он даёт три вещи, которых
+# нет у голого Prometheus: дедупликацию, подавление каскадов и silences.
+#
+# Silence понадобится буквально на следующей замене диска: массив уйдёт в
+# rebuild и покраснеет всё разом. Заглушить на два часа приятнее, чем смотреть.
+#
+# Когда захочется Telegram, правится только этот файл, UI не трогается:
+#   receivers:
+#     - name: lab-telegram
+#       telegram_configs:
+#         - bot_token: ...
+#           chat_id: ...
+#           parse_mode: HTML
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: lab-null
+  group_by: ['alertname', 'node']
+  group_wait: 30s
+  group_interval: 5m
+  # Сутки, а не часы: пока алерты живут только в UI, повторять их незачем,
+  # они и так видны. При появлении Telegram уменьшить.
+  repeat_interval: 24h
+
+  routes:
+    - matchers: ['severity = "critical"']
+      receiver: lab-null
+      group_wait: 10s
+
+receivers:
+  - name: lab-null
+
+# Подавление каскадов. Без этого недоступная нода выдаст восемь алертов про
+# свои диски, десять про гестов и один про сборщик, а полезен из них ровно один.
+inhibit_rules:
+  # Молчащий сборщик делает недостоверными все метрики ноды, поэтому гасим по
+  # ней всё остальное.
+  - source_matchers: ['alertname = "MetricsCollectorStale"']
+    target_matchers: ['severity =~ "warning|critical"']
+    equal: ['node']
+
+  # Деградировавший том важнее, чем отдельные диски в нём.
+  - source_matchers: ['alertname = "RaidArrayDegraded"']
+    target_matchers: ['alertname =~ "Disk.*|RaidPhysicalDiskNotOk"']
+    equal: ['node']
+
+  # Критичный алерт по той же сущности перекрывает предупреждение.
+  - source_matchers: ['severity = "critical"']
+    target_matchers: ['severity = "warning"']
+    equal: ['alertname', 'node']

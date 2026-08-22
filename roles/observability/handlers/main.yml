@@ -1,0 +1,19 @@
+---
+- name: Reload Prometheus
+  uri:
+    url: "http://127.0.0.1:{{ obs_prometheus_port }}/-/reload"
+    method: POST
+    status_code: [200, 204]
+  failed_when: false
+
+- name: Reload Alertmanager
+  uri:
+    url: "http://127.0.0.1:{{ obs_alertmanager_port }}/-/reload"
+    method: POST
+    status_code: [200, 204]
+  failed_when: false
+
+- name: Restart stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ obs_install_dir }}"
+    state: restarted

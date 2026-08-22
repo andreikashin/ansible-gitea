@@ -1,0 +1,75 @@
+# {{ ansible_managed }}
+#
+# Мониторинг живёт на сервис-тире, а не в K3s (§5.1 плана): из кластера не
+# видно, почему упал сам кластер. По той же причине состояние Grafana лежит
+# локально, а не на data-tier, который она же и мониторит.
+
+services:
+  prometheus:
+    image: {{ obs_images.prometheus }}
+    container_name: obs_prometheus
+    restart: always
+    user: root
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time={{ obs_prometheus_retention }}
+      - --web.enable-lifecycle
+    volumes:
+      - {{ obs_install_dir }}/prometheus:/etc/prometheus:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "{{ obs_prometheus_port }}:9090"
+    networks: [obs_net]
+
+  alertmanager:
+    image: {{ obs_images.alertmanager }}
+    container_name: obs_alertmanager
+    restart: always
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      # --web.enable-lifecycle тут НЕ нужен, это флаг Prometheus. Alertmanager
+      # перезагружает конфиг по SIGHUP и по POST /-/reload из коробки, а на
+      # неизвестный флаг он падает в цикл перезапуска.
+    volumes:
+      - {{ obs_install_dir }}/alertmanager:/etc/alertmanager:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "{{ obs_alertmanager_port }}:9093"
+    networks: [obs_net]
+
+  grafana:
+    image: {{ obs_images.grafana }}
+    container_name: obs_grafana
+    restart: always
+    environment:
+      # Три переменные ниже нужны, чтобы панель встраивалась в лаб-дашборд
+      # через iframe. Без ALLOW_EMBEDDING Grafana отдаёт X-Frame-Options и в
+      # рамке виден пустой квадрат.
+      - GF_SECURITY_ALLOW_EMBEDDING=true
+{% if obs_grafana_anonymous %}
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+{% endif %}
+      - GF_SECURITY_ADMIN_USER={{ obs_grafana_admin_user }}
+      - GF_SECURITY_ADMIN_PASSWORD={{ obs_grafana_admin_password }}
+      - GF_USERS_DEFAULT_THEME=dark
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+    volumes:
+      - {{ obs_install_dir }}/grafana/provisioning:/etc/grafana/provisioning:ro
+      - {{ obs_install_dir }}/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "{{ obs_grafana_port }}:3000"
+    depends_on: [prometheus]
+    networks: [obs_net]
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+
+networks:
+  obs_net:

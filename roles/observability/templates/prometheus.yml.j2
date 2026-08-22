@@ -1,0 +1,39 @@
+# {{ ansible_managed }}
+global:
+  scrape_interval: {{ obs_scrape_interval }}
+  evaluation_interval: {{ obs_scrape_interval }}
+  external_labels:
+    site: office
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  # Цели берутся из файла, который генерируется из инвентаря ansible. Добавил
+  # ноду в inventory.ini, прогнал плейбук, она появилась здесь и в Grafana.
+  # Отдельного конфига топологии не существует и заводить его не надо.
+  - job_name: lab-nodes
+    file_sd_configs:
+      - files: ['/etc/prometheus/targets/nodes.json']
+    relabel_configs:
+      # instance по умолчанию это "адрес:порт", читать неудобно. Метка node
+      # приходит из самих метрик агента, но у метрик node_exporter её нет,
+      # поэтому проставляем из файла целей.
+      - source_labels: [__address__]
+        target_label: instance
+      - source_labels: [node]
+        target_label: instance
+        regex: (.+)
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ['alertmanager:9093']

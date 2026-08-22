@@ -1,0 +1,34 @@
+---
+obs_install_dir: /opt/observability
+
+# Ретеншен 90 дней, а не дефолтные 15: половина смысла этих метрик в тренде
+# деградации дисков, а он виден на месяцах, не на неделях. Объём при пяти нодах
+# измеряется единицами гигабайт.
+obs_prometheus_retention: 90d
+obs_prometheus_port: 9090
+obs_alertmanager_port: 9093
+obs_grafana_port: 3000
+
+# Адрес, по которому браузер дотянется до Prometheus и Alertmanager из ссылок
+# в досках. Берётся из инвентаря, в репозиторий не попадает.
+obs_dashboard_host: "{{ ansible_host | default(inventory_hostname) }}"
+
+obs_scrape_interval: 30s
+obs_node_exporter_port: 9100
+
+# Группы инвентаря, ноды которых попадают в цели Prometheus. Один источник
+# правды: добавил ноду в инвентарь, прогнал плейбук, она появилась в Grafana.
+obs_target_groups:
+  - pve_group
+  - pve_extra
+
+# Grafana открыта на чтение без пароля и разрешает встраивание. Нужно для
+# уголка в лаб-дашборде: он рендерит панель через iframe, а Grafana по
+# умолчанию это запрещает заголовком X-Frame-Options.
+obs_grafana_anonymous: true
+obs_grafana_admin_user: admin
+
+obs_images:
+  prometheus: prom/prometheus:v3.7.3
+  alertmanager: prom/alertmanager:v0.28.1
+  grafana: grafana/grafana:12.3.1

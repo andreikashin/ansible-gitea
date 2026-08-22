@@ -1,0 +1,14 @@
+[
+{% set entries = [] %}
+{% for group in obs_target_groups %}
+{%   for host in groups.get(group, []) %}
+{%     set _ = entries.append(host) %}
+{%   endfor %}
+{% endfor %}
+{% for host in entries | unique | sort %}
+  {
+    "targets": ["{{ hostvars[host].ansible_host }}:{{ obs_node_exporter_port }}"],
+    "labels": { "node": "{{ host }}", "job": "lab-nodes" }
+  }{{ "," if not loop.last }}
+{% endfor %}
+]

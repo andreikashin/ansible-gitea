@@ -1,0 +1,85 @@
+---
+# Разворачивает стек наблюдения в гест, созданный create_observability.yml:
+# Prometheus, Alertmanager и Grafana в compose.
+#
+# Место определено в §5.1 плана: сервис-тир на pve1, а НЕ K3s. Причина в том,
+# что из кластера не видно, почему упал сам кластер. По той же причине состояние
+# Grafana лежит локально в томе, а не на data-tier, который она мониторит.
+#
+# Цели скрейпа генерируются из inventory.ini, отдельного описания топологии нет.
+#
+# Запуск:
+#   ansible-playbook create_observability.yml     # один раз, создаёт гест
+#   ansible-playbook deploy_observability.yml     # стек и конфиги
+
+- name: Deploy the observability stack
+  hosts: observability_group
+  become: true
+  vars:
+    docker_package_state: present
+
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      apt:
+        name:
+          - qemu-guest-agent
+          - curl
+          - ca-certificates
+          - python3-pip
+        state: present
+
+    # Системный python3-docker конфликтует с тем, что нужен модулю
+    # docker_compose_v2. Тот же порядок, что в deploy_traefik.yml.
+    - name: Remove the distro python3-docker
+      apt:
+        name: python3-docker
+        state: absent
+
+    - name: Install the Docker SDK via pip
+      pip:
+        name:
+          - docker
+          - requests
+        state: present
+        extra_args: "--break-system-packages"
+
+    - name: Check whether Docker is present
+      command: docker --version
+      register: obs_docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download the Docker install script
+      get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: '0755'
+      when: obs_docker_check.rc != 0
+
+    - name: Install Docker
+      command: sh /tmp/get-docker.sh
+      when: obs_docker_check.rc != 0
+
+    - name: Ensure Docker is enabled and running
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+  roles:
+    - observability
+
+  post_tasks:
+    - name: Where to look
+      debug:
+        msg:
+          - "Grafana:      http://{{ ansible_host }}:{{ obs_grafana_port }}  (вход anonymous Viewer, админ {{ obs_grafana_admin_user }})"
+          - "Prometheus:   http://{{ ansible_host }}:{{ obs_prometheus_port }}"
+          - "Alertmanager: http://{{ ansible_host }}:{{ obs_alertmanager_port }}"
+          - "Доска обзора: http://{{ ansible_host }}:{{ obs_grafana_port }}/d/lab-overview"
+          - "Панель для встраивания в лаб-дашборд: /d-solo/lab-overview?panelId=20&kiosk"

@@ -1,0 +1,16 @@
+# {{ ansible_managed }}
+#
+# Доски раскладываются как код и берутся из каталога. Ничего не кликается
+# руками, поэтому пересборка геста восстанавливает всё как было.
+apiVersion: 1
+providers:
+  - name: lab
+    orgId: 1
+    folder: Lab
+    type: file
+    disableDeletion: false
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

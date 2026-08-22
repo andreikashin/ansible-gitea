@@ -1,0 +1,223 @@
+---
+# Правила алертов по метрикам агента lab-metrics.
+#
+# Три принципа, которым подчинён весь файл.
+#
+# 1. Алерт равен действию. Если по сообщению нечего сделать прямо сейчас, это
+#    график, а не алерт. Поэтому тут нет ни загрузки CPU, ни температуры дисков:
+#    их смотрят на доске, а не получают ночью.
+#
+# 2. Алертим на протухание, а не на событие ошибки. Задача, которая не
+#    запустилась, ошибку не выдаёт, она молчит, и молчание неотличимо от успеха.
+#    Отсюда MetricsCollectorStale и BackupStale.
+#
+# 3. Рост считаем сравнением со снимком суточной давности, а не increase() и не
+#    delta(). Эти метрики объявлены gauge, increase() к ним неприменим, а delta()
+#    экстраполирует и на редко меняющихся счётчиках даёт дробные значения, из-за
+#    которых порог "> 0" начинает срабатывать на ровном месте. Сравнение с
+#    offset точное и читается однозначно.
+#
+# Осознанно НЕ делаем join с lab_raid_pd_info ради номера корзины в тексте
+# алерта. Векторное умножение отбросило бы серии, для которых соответствия нет,
+# а его нет ровно там, где не установлен hpssacli (pve1, pve2). Диск бы сыпался,
+# а алерт молчал. Корзина ищется на доске Grafana по серийнику.
+#
+# Подавление каскадов (упавшая нода не должна выдавать алерты по всем своим
+# дискам и гестам) настраивается inhibit_rules в Alertmanager, не здесь.
+
+groups:
+  - name: lab-collector
+    interval: 1m
+    rules:
+      # Самый важный алерт в файле. Без него умерший сборщик выглядит как
+      # исправное железо: старый .prom лежит на месте, Prometheus продолжает
+      # отдавать позавчерашние значения, и все графики зелёные.
+      - alert: MetricsCollectorStale
+        expr: time() - lab_metrics_last_run_timestamp_seconds > 7200
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Сборщик метрик на {{ $labels.node }} молчит более двух часов"
+          description: >-
+            Последний прогон lab-metrics был {{ $value | humanizeDuration }} назад
+            при интервале в час. Значения по этой ноде больше не обновляются,
+            и все остальные алерты по ней сейчас недостоверны.
+            Проверить: systemctl status lab-metrics.service lab-metrics.timer
+
+      # Проба идёт раз в час, поэтому for: 2h это два подряд неудачных прогона,
+      # а не случайный таймаут.
+      - alert: MetricsProbeFailing
+        expr: lab_metrics_probe_ok == 0
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Проба {{ $labels.probe }} на {{ $labels.node }} не отрабатывает"
+          description: >-
+            Проба применима на этой машине, но падает. Данные по её части
+            железа отсутствуют. Частый случай на G7 и Gen9: проба raid-hpsa
+            видит контроллер, но не находит hpssacli, потому что ssacli 4.x
+            поддержку P410i выбросил и нужен legacy 2.40.
+            Проверить: /usr/lib/lab-metrics/probes/{{ $labels.probe }} collect
+
+  - name: lab-disks
+    interval: 1m
+    rules:
+      # Неисправленные ошибки чтения это диск, который не смог отдать данные ни
+      # с ECC, ни с повторов. В зеркале контроллер возьмёт блок с пары, но сбой
+      # был. Рост этого счётчика важнее абсолютного значения: накопленные за
+      # годы ошибки могут быть старым шрамом.
+      - alert: DiskUncorrectedErrorsGrowing
+        expr: lab_disk_uncorrected_errors - (lab_disk_uncorrected_errors offset 24h) > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Диск {{ $labels.serial }} на {{ $labels.node }}: свежие неисправленные ошибки чтения"
+          description: >-
+            За сутки прибавилось {{ $value }} ошибок, которые диск не смог
+            восстановить. Это активная деградация, а не историческая.
+            Найти корзину по серийнику и планировать замену.
+
+      - alert: DiskDefectsGrowing
+        expr: lab_disk_grown_defects - (lab_disk_grown_defects offset 24h) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Диск {{ $labels.serial }} на {{ $labels.node }}: растёт список дефектов"
+          description: >-
+            За сутки переназначено ещё {{ $value }} блоков. Единичный прирост
+            это нормальное старение, устойчивый это износ.
+
+      - alert: DiskDefectsGrowingFast
+        expr: lab_disk_grown_defects - (lab_disk_grown_defects offset 24h) >= 10
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Диск {{ $labels.serial }} на {{ $labels.node }} сыплется активно"
+          description: >-
+            {{ $value }} новых дефектов за сутки. Диск на замену, не откладывая.
+
+  - name: lab-raid
+    interval: 1m
+    rules:
+      # Состояние массива важнее состояния отдельного диска: деградировавший том
+      # это один сбой до потери данных.
+      - alert: RaidArrayDegraded
+        expr: lab_raid_array_ok == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Том {{ $labels.array }}/{{ $labels.ld }} ({{ $labels.level }}) на {{ $labels.node }} не в порядке"
+
+      - alert: RaidPhysicalDiskNotOk
+        expr: lab_raid_pd_ok == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Контроллер на {{ $labels.node }} считает диск в корзине {{ $labels.bay }} неисправным"
+          description: "Серийник {{ $labels.serial }}."
+
+      # Батарея кэша умирает молча: контроллер тихо уходит с write-back на
+      # write-through, нода начинает тормозить, и в логах об этом ничего нет.
+      - alert: RaidBatteryBad
+        expr: lab_raid_battery_ok == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Батарея кэша контроллера на {{ $labels.node }} неисправна или отсутствует"
+          description: >-
+            Без исправной батареи write-back отключён, и запись идёт напрямую
+            на диски. Это не потеря данных, но нода будет заметно медленнее.
+
+      - alert: RaidCacheDisabled
+        expr: lab_raid_cache_ok == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Кэш контроллера на {{ $labels.node }} отключён"
+
+      - alert: MdraidDegraded
+        expr: lab_mdraid_array_ok == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Массив {{ $labels.array }} ({{ $labels.level }}) на {{ $labels.node }} деградировал"
+          description: >-
+            Активно {{ $value }} дисков из положенных. Если в массиве прописан
+            горячий запас, пересборка должна была начаться сама, проверить
+            lab_mdraid_sync_percent.
+
+  - name: lab-storage
+    interval: 1m
+    rules:
+      # Метаданные thin-пула кончаются РАНЬШЕ данных и убивают пул целиком,
+      # поэтому у них порог строже и severity выше при том же проценте.
+      - alert: ThinPoolMetadataHigh
+        expr: lab_lvm_thinpool_meta_percent > 80
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Метаданные пула {{ $labels.vg }}/{{ $labels.pool }} на {{ $labels.node }} заполнены на {{ $value }}%"
+          description: >-
+            При исчерпании метаданных пул уходит в read-only целиком, и
+            восстановление оттуда нетривиально. Расширять lv метаданных сейчас.
+
+      - alert: ThinPoolDataCritical
+        expr: lab_lvm_thinpool_data_percent > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Пул {{ $labels.vg }}/{{ $labels.pool }} на {{ $labels.node }} заполнен на {{ $value }}%"
+          description: "При 100% гесты уходят в read-only и файловые системы внутри бьются."
+
+      - alert: ThinPoolDataHigh
+        expr: lab_lvm_thinpool_data_percent > 80
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Пул {{ $labels.vg }}/{{ $labels.pool }} на {{ $labels.node }} заполнен на {{ $value }}%"
+
+  - name: lab-backup
+    interval: 1m
+    rules:
+      # 26 часов, а не 24: суточное расписание плюс запас на длительность самой
+      # задачи и на разброс времени старта.
+      - alert: BackupStale
+        expr: time() - lab_backup_last_success_timestamp_seconds > 26 * 3600
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Бэкап геста {{ $labels.vmid }} на {{ $labels.node }} не проходил больше суток"
+          description: >-
+            Последний успешный vzdump был {{ $value | humanizeDuration }} назад.
+            Этот алерт ловит и упавшую задачу, и не запустившийся таймер, и
+            остановленную ноду, потому что смотрит на возраст успеха, а не на
+            наличие ошибки.
+
+  - name: lab-guests
+    interval: 1m
+    rules:
+      # Поодиночке обе метрики бесполезны: остановленный гест это норма, если
+      # его никто не просил стартовать. Проблема только в сочетании.
+      - alert: GuestShouldBeRunning
+        expr: lab_guest_onboot == 1 and lab_guest_running == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Гест {{ $labels.name }} ({{ $labels.vmid }}) на {{ $labels.node }} должен работать, но остановлен"
+          description: >-
+            Либо упал, либо переехал на другую ноду и его забыли вернуть.

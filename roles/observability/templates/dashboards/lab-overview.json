@@ -1,0 +1,877 @@
+{
+  "uid": "lab-overview",
+  "title": "Лаба, обзор",
+  "tags": [
+    "lab"
+  ],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 2,
+  "refresh": "1m",
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "links": [
+    {
+      "title": "Prometheus",
+      "type": "link",
+      "icon": "external link",
+      "url": "http://[[ obs_dashboard_host ]]:[[ obs_prometheus_port ]]",
+      "targetBlank": true
+    },
+    {
+      "title": "Alertmanager",
+      "type": "link",
+      "icon": "external link",
+      "url": "http://[[ obs_dashboard_host ]]:[[ obs_alertmanager_port ]]",
+      "targetBlank": true
+    }
+  ],
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Ноды отвечают",
+      "id": 1,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(up{job=\"lab-nodes\"} == 1)",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Пробы падают",
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 3,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(lab_metrics_probe_ok == 0) or vector(0)",
+          "instant": true
+        }
+      ],
+      "description": "Проба применима на ноде, но не отрабатывает. Данные по её части железа отсутствуют, а молчание тут неотличимо от исправного железа."
+    },
+    {
+      "type": "stat",
+      "title": "Алерты горят",
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 6,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(ALERTS{alertstate=\"firing\"}) or vector(0)",
+          "instant": true
+        }
+      ],
+      "description": "Состояние firing: условие продержалось весь срок for, алерт настоящий и ушёл в Alertmanager. Соседняя плитка показывает те, что ещё отсчитывают таймер."
+    },
+    {
+      "type": "stat",
+      "title": "Алерты зреют",
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 9,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(ALERTS{alertstate=\"pending\"}) or vector(0)",
+          "instant": true
+        }
+      ],
+      "description": "Состояние pending: проблема уже обнаружена, но идёт отсчёт for, это защита от мигания. Ноль в соседней плитке при ненулевом здесь НЕ означает, что всё хорошо."
+    },
+    {
+      "type": "stat",
+      "title": "Массивы не в порядке",
+      "id": 5,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 12,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(lab_raid_array_ok == 0) or vector(0)",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Без write-back",
+      "id": 6,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 15,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(lab_raid_battery_ok == 0) or vector(0)",
+          "instant": true
+        }
+      ],
+      "description": "Батарея кэша мертва или отсутствует, контроллер ушёл в write-through. Данные не в опасности, страдает скорость мелкой записи."
+    },
+    {
+      "type": "stat",
+      "title": "Диски с ошибками",
+      "id": 7,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 18,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(lab_disk_uncorrected_errors > 0) or vector(0)",
+          "instant": true
+        }
+      ],
+      "description": "Диски с ненулевым счётчиком неисправленных чтений. Само по себе не приговор: счётчик накопительный за всю жизнь диска. Смотреть надо на график тренда ниже."
+    },
+    {
+      "type": "stat",
+      "title": "Бэкапы старше суток",
+      "id": 8,
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 21,
+        "y": 0
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(time() - lab_backup_last_success_timestamp_seconds > 26*3600) or vector(0)",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Алерты: что именно сработало",
+      "id": 15,
+      "description": "pending значит, что проблема обнаружена и идёт отсчёт for. firing значит, что алерт уже настоящий. Постоянно горящий алерт хуже отсутствующего: к нему привыкают. Если условие верно, но чинить его будете нескоро, заглушите в Alertmanager на срок, а не игнорируйте.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "ALERTS",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "Value": true,
+              "controller": true,
+              "slot": true,
+              "ld": true,
+              "transport": true,
+              "probe": true
+            },
+            "renameByName": {
+              "alertstate": "Состояние",
+              "severity": "Важность",
+              "alertname": "Алерт",
+              "node": "Нода",
+              "serial": "Серийник",
+              "bay": "Корзина",
+              "vmid": "VMID",
+              "name": "Имя",
+              "pool": "Пул",
+              "vg": "VG",
+              "array": "Массив",
+              "type": "Тип"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Важность",
+                "desc": false
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Важность"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "critical": {
+                        "text": "критично",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "warning": {
+                        "text": "важно",
+                        "color": "orange",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Состояние"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "firing": {
+                        "text": "горит",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "pending": {
+                        "text": "зреет",
+                        "color": "yellow",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Неисправленные ошибки чтения: тренд",
+      "id": 10,
+      "description": "Абсолютное значение мало что значит: счётчик накопительный за всю жизнь диска и может быть старым шрамом. Значение имеет НАКЛОН линии.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_disk_uncorrected_errors > 0",
+          "legendFormat": "{{node}} {{serial}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Переназначенные блоки: тренд",
+      "id": 11,
+      "description": "Единичный прирост это нормальное старение, устойчивый рост это износ.",
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 5
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_disk_grown_defects > 0",
+          "legendFormat": "{{node}} {{serial}}"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Диски: где стоит и как себя чувствует",
+      "id": 20,
+      "description": "Корзина берётся из lab_raid_pd_info. Если её нет, на ноде не установлен ssacli.",
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_disk_grown_defects",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "lab_disk_uncorrected_errors",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "lab_disk_power_on_hours",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "expr": "lab_raid_pd_info",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "serial",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "node 2": true,
+              "node 3": true,
+              "node 4": true,
+              "controller": true,
+              "slot": true,
+              "array": true,
+              "Value #D": true,
+              "transport": true,
+              "dev": true,
+              "model": true,
+              "vendor": true,
+              "Time 1": true,
+              "Time": true,
+              "__name__ 1": true,
+              "__name__": true,
+              "job 1": true,
+              "job": true,
+              "instance 1": true,
+              "instance": true,
+              "Time 2": true,
+              "__name__ 2": true,
+              "job 2": true,
+              "instance 2": true,
+              "Time 3": true,
+              "__name__ 3": true,
+              "job 3": true,
+              "instance 3": true,
+              "Time 4": true,
+              "__name__ 4": true,
+              "job 4": true,
+              "instance 4": true
+            },
+            "renameByName": {
+              "node 1": "Нода",
+              "serial": "Серийник",
+              "bay": "Корзина",
+              "Value #A": "Дефекты",
+              "Value #B": "Неисправленные",
+              "Value #C": "Часы"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Неисправленные",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Контроллеры: массив, кэш, батарея",
+      "id": 30,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 33
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_raid_array_ok",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "lab_raid_cache_ok",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "lab_raid_battery_ok",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "node",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "array": true,
+              "ld": true,
+              "controller 2": true,
+              "controller 3": true,
+              "Time 1": true,
+              "__name__ 1": true,
+              "job 1": true,
+              "instance 1": true,
+              "slot 1": true,
+              "Time 2": true,
+              "__name__ 2": true,
+              "job 2": true,
+              "instance 2": true,
+              "slot 2": true,
+              "Time 3": true,
+              "__name__ 3": true,
+              "job 3": true,
+              "instance 3": true,
+              "slot 3": true
+            },
+            "renameByName": {
+              "node": "Нода",
+              "controller 1": "Контроллер",
+              "level": "Уровень",
+              "Value #A": "Массив",
+              "Value #B": "Кэш",
+              "Value #C": "Батарея"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "Массив|Кэш|Батарея"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "ПЛОХО",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "OK",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Thin-пулы",
+      "id": 40,
+      "description": "Метаданные кончаются РАНЬШЕ данных и убивают пул целиком, восстановление нетривиально. Поэтому порог у них строже.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 33
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 100,
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 90
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_lvm_thinpool_data_percent",
+          "instant": true,
+          "legendFormat": "{{node}} {{pool}} данные"
+        },
+        {
+          "refId": "B",
+          "expr": "lab_lvm_thinpool_meta_percent",
+          "instant": true,
+          "legendFormat": "{{node}} {{pool}} метаданные"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Гесты, которые должны работать, но стоят",
+      "id": 50,
+      "description": "onboot=1 и не запущен. Либо упал, либо переехал на другую ноду и его забыли вернуть.",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 41
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "lab_guest_onboot == 1 and lab_guest_running == 0",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "job": true,
+              "instance": true,
+              "Value": true
+            },
+            "renameByName": {
+              "node": "Нода",
+              "vmid": "VMID",
+              "name": "Имя",
+              "type": "Тип"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

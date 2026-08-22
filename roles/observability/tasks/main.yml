@@ -1,0 +1,157 @@
+---
+- name: Create directory layout
+  file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+  loop:
+    - "{{ obs_install_dir }}"
+    - "{{ obs_install_dir }}/prometheus"
+    - "{{ obs_install_dir }}/prometheus/rules"
+    - "{{ obs_install_dir }}/prometheus/targets"
+    - "{{ obs_install_dir }}/alertmanager"
+    - "{{ obs_install_dir }}/grafana/provisioning/datasources"
+    - "{{ obs_install_dir }}/grafana/provisioning/dashboards"
+    - "{{ obs_install_dir }}/grafana/dashboards"
+
+# Правила и доски едут как код. Ничего не кликается руками, поэтому пересборка
+# геста восстанавливает состояние целиком.
+- name: Install alert rules
+  copy:
+    src: rules/
+    dest: "{{ obs_install_dir }}/prometheus/rules/"
+    mode: '0644'
+  notify: Reload Prometheus
+
+# Доски рендерятся шаблонизатором ради ссылок на Prometheus и Alertmanager:
+# адрес геста не должен быть зашит в файл. Разметка сдвинута на [[ ]], потому
+# что Grafana держит в legendFormat собственные {{ }}, и обычные разделители
+# съели бы подписи на графиках.
+- name: Install dashboards
+  template:
+    src: "{{ item }}"
+    dest: "{{ obs_install_dir }}/grafana/dashboards/{{ item | basename }}"
+    mode: '0644'
+    variable_start_string: '[['
+    variable_end_string: ']]'
+  with_fileglob:
+    - "{{ role_path }}/templates/dashboards/*.json"
+
+# Цели генерируются из инвентаря ansible. Отдельного описания топологии не
+# существует: добавил ноду в inventory.ini, прогнал плейбук, она здесь.
+- name: Generate scrape targets from the inventory
+  template:
+    src: nodes.json.j2
+    dest: "{{ obs_install_dir }}/prometheus/targets/nodes.json"
+    mode: '0644'
+  notify: Reload Prometheus
+
+- name: Generate Prometheus config
+  template:
+    src: prometheus.yml.j2
+    dest: "{{ obs_install_dir }}/prometheus/prometheus.yml"
+    mode: '0644'
+  notify: Reload Prometheus
+
+- name: Generate Alertmanager config
+  template:
+    src: alertmanager.yml.j2
+    dest: "{{ obs_install_dir }}/alertmanager/alertmanager.yml"
+    mode: '0644'
+  notify: Reload Alertmanager
+
+- name: Generate Grafana datasource provisioning
+  template:
+    src: grafana-datasource.yml.j2
+    dest: "{{ obs_install_dir }}/grafana/provisioning/datasources/prometheus.yml"
+    mode: '0644'
+  notify: Restart stack
+
+- name: Generate Grafana dashboard provisioning
+  template:
+    src: grafana-dashboards.yml.j2
+    dest: "{{ obs_install_dir }}/grafana/provisioning/dashboards/lab.yml"
+    mode: '0644'
+  notify: Restart stack
+
+- name: Generate compose file
+  template:
+    src: compose.yml.j2
+    dest: "{{ obs_install_dir }}/compose.yml"
+    mode: '0640'
+  notify: Restart stack
+
+- name: Start the stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ obs_install_dir }}"
+    state: present
+
+- name: Wait for the services to answer
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ item }}"
+    timeout: 180
+  loop:
+    - "{{ obs_prometheus_port }}"
+    - "{{ obs_alertmanager_port }}"
+    - "{{ obs_grafana_port }}"
+
+- name: Flush handlers so reloads happen before verification
+  meta: flush_handlers
+
+# Проверка не косметическая: стек может подняться и при этом не собирать
+# ничего, если цели недоступны или правила не разобрались. Молчащий мониторинг
+# хуже отсутствующего, потому что создаёт ложное спокойствие.
+# Ждём именно первого УСПЕШНОГО СКРЕЙПА, а не первого ответа API. Сразу после
+# рестарта Prometheus цели заведены, но health у них ещё unknown, и проверка на
+# "API ответил" проходит раньше, чем появляются данные.
+- name: Wait until every lab node is actually scraped
+  uri:
+    url: "http://127.0.0.1:{{ obs_prometheus_port }}/api/v1/targets?state=active"
+    return_content: true
+  register: obs_targets
+  until: >-
+    obs_targets.status == 200 and
+    (obs_targets.json.data.activeTargets
+      | selectattr('labels.job', 'equalto', 'lab-nodes')
+      | selectattr('health', 'equalto', 'up') | list | length)
+      >= (obs_target_groups | map('extract', groups) | select('defined')
+          | flatten | unique | list | length)
+  retries: 18
+  delay: 10
+  failed_when: false
+
+- name: Read loaded rules back from Prometheus
+  uri:
+    url: "http://127.0.0.1:{{ obs_prometheus_port }}/api/v1/rules"
+    return_content: true
+  register: obs_rules
+
+- name: Verify every lab node is being scraped
+  vars:
+    lab_targets: "{{ obs_targets.json.data.activeTargets
+                     | selectattr('labels.job', 'equalto', 'lab-nodes') | list }}"
+    lab_up: "{{ obs_targets.json.data.activeTargets
+                | selectattr('labels.job', 'equalto', 'lab-nodes')
+                | selectattr('health', 'equalto', 'up') | list }}"
+    expected: "{{ obs_target_groups | map('extract', groups) | select('defined') | flatten | unique | list }}"
+  assert:
+    that:
+      - lab_targets | length == expected | length
+      - lab_up | length == expected | length
+      - obs_rules.json.data.groups | length > 0
+    fail_msg: >-
+      Стек поднялся, но собирает не всё. Ожидалось нод: {{ expected | length }},
+      целей заведено: {{ lab_targets | length }}, отвечает: {{ lab_up | length }}.
+      Групп правил загружено: {{ obs_rules.json.data.groups | length }}.
+      Недоступные цели:
+      {{ lab_targets | rejectattr('health', 'equalto', 'up')
+         | map(attribute='labels.node') | list | join(', ') | default('нет', true) }}
+    quiet: true
+
+- name: Report what is collected
+  debug:
+    msg:
+      - "Целей в работе: {{ obs_targets.json.data.activeTargets | selectattr('labels.job', 'equalto', 'lab-nodes') | list | length }}"
+      - "Групп правил: {{ obs_rules.json.data.groups | length }}"
+      - "Правил всего: {{ obs_rules.json.data.groups | map(attribute='rules') | map('length') | sum }}"

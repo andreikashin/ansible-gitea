@@ -1,0 +1,114 @@
+---
+# Создание геста под мониторинг клонированием шаблона Debian на pve1.
+#
+# Почему отдельным плейбуком от deploy_observability.yml: создание геста это
+# разовая операция на ноде Proxmox, а деплой стека идёт уже внутрь геста по SSH.
+# Смешивать их в один play нельзя, у них разные hosts.
+#
+# Размещение на pve1 определено в §5.1 плана: мониторинг живёт на сервис-тире,
+# а НЕ в K3s, потому что из кластера не видно, почему упал сам кластер.
+#
+# Запуск:
+#   ansible-playbook create_observability.yml
+#   ansible-playbook create_observability.yml --check --diff   # посмотреть план
+
+- name: Provision the observability guest on Proxmox
+  hosts: "{{ obs_pve_target | default('pve1') }}"
+  become: true
+  gather_facts: false
+  vars:
+    obs_vars: "{{ hostvars[groups['observability_group'] | first] }}"
+    obs_vmid: "{{ obs_vars.obs_vmid }}"
+    obs_template_vmid: "{{ obs_vars.obs_template_vmid }}"
+    obs_vm_name: "{{ obs_vars.obs_vm_name }}"
+    obs_ip: "{{ obs_vars.obs_ip }}"
+    obs_cidr: "{{ obs_vars.obs_cidr }}"
+    obs_gateway: "{{ obs_vars.obs_gateway }}"
+    obs_nameserver: "{{ obs_vars.obs_nameserver }}"
+    obs_cores: "{{ obs_vars.obs_cores }}"
+    obs_memory: "{{ obs_vars.obs_memory }}"
+    obs_disk_grow: "{{ obs_vars.obs_disk_grow }}"
+    obs_storage: "{{ obs_vars.obs_storage }}"
+
+  tasks:
+    - name: Validate the source template exists and is a template
+      command: "qm config {{ obs_template_vmid }}"
+      register: obs_tmpl
+      changed_when: false
+
+    - name: Fail if the source is not a template
+      assert:
+        that: "'template: 1' in obs_tmpl.stdout"
+        fail_msg: >-
+          VMID {{ obs_template_vmid }} на {{ inventory_hostname }} не является шаблоном.
+          Клонировать живой гест этим плейбуком нельзя.
+        quiet: true
+
+    # Занятый VMID не перезаписываем никогда: на другом конце может оказаться
+    # работающий сервис, а qm clone поверх него молча не пройдёт только если
+    # повезёт.
+    - name: Check whether the target VMID is already taken
+      command: "qm config {{ obs_vmid }}"
+      register: obs_existing
+      changed_when: false
+      failed_when: false
+
+    - name: Clone the template
+      command:
+        argv:
+          - qm
+          - clone
+          - "{{ obs_template_vmid }}"
+          - "{{ obs_vmid }}"
+          - --name
+          - "{{ obs_vm_name }}"
+          - --full
+          - "1"
+          - --storage
+          - "{{ obs_storage }}"
+      when: obs_existing.rc != 0
+
+    - name: Apply resources and static addressing
+      command:
+        argv:
+          - qm
+          - set
+          - "{{ obs_vmid }}"
+          - --cores
+          - "{{ obs_cores }}"
+          - --memory
+          - "{{ obs_memory }}"
+          - --onboot
+          - "1"
+          - --ipconfig0
+          - "ip={{ obs_ip }}/{{ obs_cidr }},gw={{ obs_gateway }}"
+          - --nameserver
+          - "{{ obs_nameserver }}"
+      when: obs_existing.rc != 0
+
+    # Шаблон отдаёт 16 ГБ. Prometheus с ретеншеном 90 дней на пять нод занимает
+    # единицы гигабайт, но Grafana, образы и журналы туда тоже лягут.
+    - name: Grow the root disk
+      command: "qm resize {{ obs_vmid }} scsi0 +{{ obs_disk_grow }}"
+      when: obs_existing.rc != 0
+
+    - name: Start the guest
+      command: "qm start {{ obs_vmid }}"
+      register: obs_start
+      changed_when: "'already running' not in obs_start.stderr"
+      failed_when: obs_start.rc != 0 and 'already running' not in obs_start.stderr
+
+    - name: Wait for SSH on the new guest
+      wait_for:
+        host: "{{ obs_ip }}"
+        port: 22
+        timeout: 300
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      debug:
+        msg:
+          - "Гест {{ obs_vm_name }} ({{ obs_vmid }}) на {{ inventory_hostname }}, адрес {{ obs_ip }}."
+          - "{{ 'Создан.' if obs_existing.rc != 0 else 'Уже существовал, параметры не трогали.' }}"
+          - "Дальше: ansible-playbook deploy_observability.yml"
