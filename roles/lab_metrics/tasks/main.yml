@@ -12,6 +12,31 @@
     update_cache: true
     cache_valid_time: 3600
 
+# Пакет тянется по URL, а не из репозитория: подключать репозиторий вендора
+# ради одной утилиты значит расширять доверие на весь его индекс. creates
+# делает задачу идемпотентной, повторный прогон ничего не качает.
+- name: Check whether the Smart Array utility is already installed
+  stat:
+    path: /usr/sbin/ssacli
+  register: lab_metrics_ssacli
+  when: lab_metrics_install_ssacli | bool
+
+- name: Download the Smart Array utility
+  get_url:
+    url: "{{ lab_metrics_ssacli_url }}"
+    dest: /tmp/ssacli.deb
+    mode: '0644'
+  when:
+    - lab_metrics_install_ssacli | bool
+    - not lab_metrics_ssacli.stat.exists
+
+- name: Install the Smart Array utility
+  apt:
+    deb: /tmp/ssacli.deb
+  when:
+    - lab_metrics_install_ssacli | bool
+    - not lab_metrics_ssacli.stat.exists
+
 - name: Install node exporter
   apt:
     name: prometheus-node-exporter

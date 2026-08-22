@@ -24,6 +24,13 @@ lab_metrics_on_boot_sec: 2min
 lab_metrics_splay: 5min
 lab_metrics_timeout: 120
 
+# Утилита HP для опроса Smart Array. В apt её нет, вендор отдаёт .deb.
+# По умолчанию выключено: на машинах без Smart Array она не нужна, а на
+# HP-нодах без неё проба raid-smartarray молча возвращает ноль, и ни массив,
+# ни батарея, ни кэш в метрики не попадают. Включается в host_vars ноды.
+lab_metrics_install_ssacli: false
+lab_metrics_ssacli_url: "https://downloads.linux.hpe.com/SDR/repo/mcp/pool/non-free/ssacli-6.60-8.0_amd64.deb"
+
 # Ставить ли node_exporter. Выключается, если на ноде он уже есть из другого
 # источника.
 lab_metrics_install_node_exporter: true
