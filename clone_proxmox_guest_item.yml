@@ -151,6 +151,20 @@
           register: clone_restore_lxc
           when: clone_type == 'lxc'
 
+        # Восстановление обычно возвращает шаблон сразу шаблоном: признак
+        # лежит в архиве. Повторная пометка в этом случае падает с "you can't
+        # convert a template to a template", поэтому сначала смотрим на
+        # текущее состояние гостя.
+        - name: Read restored guest config
+          command:
+            argv:
+              - "{{ 'qm' if clone_type == 'qemu' else 'pct' }}"
+              - config
+              - "{{ clone_vmid }}"
+          register: clone_restored_config
+          changed_when: false
+          when: clone_is_template | bool
+
         - name: Mark restored QEMU guest as template
           command:
             argv:
@@ -160,6 +174,7 @@
           when:
             - clone_type == 'qemu'
             - clone_is_template | bool
+            - "'template: 1' not in (clone_restored_config.stdout | default(''))"
 
         - name: Mark restored LXC guest as template
           command:
@@ -170,6 +185,7 @@
           when:
             - clone_type == 'lxc'
             - clone_is_template | bool
+            - "'template: 1' not in (clone_restored_config.stdout | default(''))"
 
         - name: Remove pulled archive on target
           file:

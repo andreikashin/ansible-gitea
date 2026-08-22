@@ -92,13 +92,25 @@
       register: rg_pctrestore
       changed_when: rg_pctrestore.rc == 0
 
-    # vzdump не сохраняет признак шаблона: восстановленный шаблон приходит
-    # обычной ВМ. Возвращаем флаг по явному списку restore_template_vmids.
+    # Признак шаблона в архиве vzdump сохраняется, и qmrestore обычно
+    # возвращает гостя сразу шаблоном. Но так бывает не всегда, поэтому флаг
+    # по списку restore_template_vmids всё равно проверяется. Без проверки
+    # текущего состояния qm template падает с "you can't convert a template
+    # to a template", и гость числится неудачей, хотя стоит на месте целым.
+    - name: "Check whether {{ restore_guest.vmid }} is already a template"
+      command: "qm config {{ restore_guest.vmid }}"
+      register: rg_current_config
+      changed_when: false
+      when:
+        - rg_is_template | bool
+        - restore_guest.type == 'qemu'
+
     - name: "Convert {{ restore_guest.vmid }} back into a template"
       command: "qm template {{ restore_guest.vmid }}"
       when:
         - rg_is_template | bool
         - restore_guest.type == 'qemu'
+        - "'template: 1' not in (rg_current_config.stdout | default(''))"
       register: rg_template
       changed_when: rg_template.rc == 0
 
