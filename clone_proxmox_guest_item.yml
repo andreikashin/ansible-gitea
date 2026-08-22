@@ -123,6 +123,14 @@
             {{ (clone_remote_dumpdir ~ '/') | quote }}
           args:
             executable: /bin/bash
+          # Асинхронно, как и сам vzdump выше. Синхронная задача держит одно
+          # SSH-соединение всё время переноса, и обрыв этого соединения убивает
+          # её целиком, вместе с циклом повторов: ansible объявляет хост
+          # недоступным раньше, чем until успевает сработать. В асинхронном
+          # виде rsync живёт на ноде сам, а управляющая машина только
+          # опрашивает его короткими подключениями.
+          async: "{{ clone_pull_async_timeout | int }}"
+          poll: "{{ clone_pull_poll_interval | int }}"
           register: clone_pull_result
           changed_when: clone_pull_result.rc == 0
           until: clone_pull_result.rc == 0

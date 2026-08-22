@@ -71,6 +71,11 @@
     clone_backup_poll_interval: 30
     clone_backup_compress: zstd
 
+    # Тайминги переноса архива. Отдельно от vzdump: на медленной линии перенос
+    # идёт заметно дольше самого дампа.
+    clone_pull_async_timeout: 86400
+    clone_pull_poll_interval: 30
+
     # Каталоги с файлами шаблонов/ISO для переноса (rsync файлов, без restore).
     clone_template_dirs:
       - /var/lib/vz/template/iso
