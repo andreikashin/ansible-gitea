@@ -44,3 +44,15 @@ proxmox_backup_node_config_paths:
   - /etc/gshadow
   - /etc/sudoers
   - /etc/sudoers.d
+
+# ISO images and container templates, handled by backup_proxmox_template_files.yml
+# rather than by the guest backup. vzdump captures guests, not the media they were
+# installed from, so after a reinstall these directories come back empty. They are
+# also the awkward kind of file to reassemble by hand: point releases move to
+# archive mirrors and driver ISOs tend to be pinned to a version.
+# Kept out of the guest backup because the cadence differs. Guests are worth
+# dumping regularly, these change a couple of times a year.
+proxmox_backup_template_dirs:
+  - /var/lib/vz/template/iso
+  - /var/lib/vz/template/cache
+proxmox_backup_template_subdir: template

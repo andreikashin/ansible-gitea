@@ -1,0 +1,180 @@
+---
+# Бэкап ISO-образов и шаблонов контейнеров с Proxmox-ноды на control-нод.
+#
+# Зачем отдельным плейбуком, а не внутри backup_proxmox_vms.yml: vzdump снимает
+# гостей, а не файлы, из которых их когда-то устанавливали. После пересоздания
+# массива и переустановки PVE каталоги /var/lib/vz/template окажутся пустыми, а
+# собрать их обратно руками неприятно: старые точечные релизы уезжают на архивные
+# зеркала, часть образов зафиксирована конкретной версией, и именно из них
+# собирались VM-шаблоны. Объём при этом единицы гигабайт, держать дёшево.
+#
+# Отдельный плейбук ещё и потому, что ритм другой. Гостей есть смысл снимать
+# регулярно, ISO меняются раз в полгода: гонять их каждый раз незачем, а перед
+# переустановкой ноды нужны обязательно.
+#
+# Копирование инкрементальное (rsync), поэтому повторный прогон почти бесплатен.
+# На ноде playbook ничего не меняет и не удаляет, операция только на чтение.
+#
+# Куда кладёт (рядом с архивами гостей, отдельным подкаталогом):
+#   {{ proxmox_backup_local_dir }}/<folder>/template/iso
+#   {{ proxmox_backup_local_dir }}/<folder>/template/cache
+#
+# Нацеливание на одну ноду делается через proxmox_target, а НЕ через --limit.
+# --limit фильтрует все play разом, включая первый (localhost), поэтому проверка
+# rsync на control-ноде молча не выполнится: play получит ноль хостов и будет
+# пропущен без ошибки. Та же особенность у backup_proxmox_vms.yml.
+#
+# Примеры:
+#   ansible-playbook backup_proxmox_template_files.yml -e proxmox_target=pve3
+#   # выкинуть локально то, чего уже нет на ноде (по умолчанию НЕ выкидывает):
+#   ansible-playbook backup_proxmox_template_files.yml -e proxmox_target=pve3 -e proxmox_template_sync_delete=true
+
+- name: Check rsync on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check rsync on control node
+      command: rsync --version
+      register: template_rsync_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if rsync is missing on control node
+      fail:
+        msg: >-
+          rsync is required on the control node (localhost/WSL) to copy template files.
+          Install it before rerunning, for example: sudo apt install rsync
+      when: template_rsync_check.rc != 0
+
+- name: Back up ISO images and container templates
+  hosts: "{{ proxmox_target | default('pve_group') }}"
+  gather_facts: false
+  vars:
+    proxmox_ssh_user: "{{ ansible_user | default('root') }}"
+    ansible_remote_tmp: "/tmp/.ansible-{{ proxmox_ssh_user }}"
+    # По умолчанию локальная копия только пополняется. Удаление того, чего уже нет
+    # на ноде, включается явно: иначе достаточно один раз прогнать плейбук против
+    # переустановленной пустой ноды, чтобы вычистить единственную копию образов.
+    proxmox_template_sync_delete: false
+    proxmox_template_dest_dir: "{{ proxmox_backup_host_dir }}/{{ proxmox_backup_template_subdir }}"
+
+  tasks:
+    - name: Ensure the local backup path is configured
+      assert:
+        that:
+          - proxmox_backup_local_dir is defined
+          - proxmox_backup_local_dir | length > 0
+        fail_msg: >-
+          proxmox_backup_local_dir is not set for {{ inventory_hostname }}.
+          Define it in host_vars/{{ inventory_hostname }}.yml (gitignored).
+        quiet: true
+
+    - name: Ensure the local destination directory exists
+      file:
+        path: "{{ proxmox_template_dest_dir }}"
+        state: directory
+        mode: '0755'
+      delegate_to: localhost
+      become: false
+
+    - name: Prepare rsync transfer settings
+      set_fact:
+        template_rsync_ssh_key: >-
+          {{
+            (hostvars[inventory_hostname].ansible_ssh_private_key_file | default('~/.ssh/id_rsa'))
+            | regex_replace('^~', lookup('env', 'HOME'))
+          }}
+        template_rsync_remote_user: "{{ proxmox_ssh_user }}"
+        template_rsync_remote_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+      changed_when: false
+
+    - name: Build the rsync ssh command
+      set_fact:
+        template_rsync_ssh_command: >-
+          ssh -i {{ template_rsync_ssh_key }}
+          -p {{ hostvars[inventory_hostname].ansible_port | default(hostvars[inventory_hostname].ansible_ssh_port | default(22)) }}
+          -o ConnectTimeout=15
+          -o BatchMode=yes
+          -o ServerAliveInterval=15
+          -o ServerAliveCountMax=4
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+      changed_when: false
+
+    # Каталога может не быть вовсе (на свежей ноде cache пустой и не создан),
+    # это не ошибка: такой источник просто пропускается.
+    - name: Check which template directories exist on the node
+      stat:
+        path: "{{ item }}"
+      loop: "{{ proxmox_backup_template_dirs }}"
+      register: template_dir_stat
+      changed_when: false
+
+    - name: Build the list of directories to pull
+      set_fact:
+        template_dirs_present: >-
+          {{ template_dir_stat.results
+             | selectattr('stat.exists', 'equalto', true)
+             | selectattr('stat.isdir', 'equalto', true)
+             | map(attribute='item')
+             | list }}
+      changed_when: false
+
+    - name: Report when there is nothing to copy
+      debug:
+        msg: >-
+          None of {{ proxmox_backup_template_dirs | join(', ') }} exist on
+          {{ inventory_hostname }}. Nothing to back up.
+      when: template_dirs_present | length == 0
+
+    # Трейлинг-слэш у источника обязателен: он означает "содержимое каталога",
+    # иначе rsync вложит каталог внутрь самого себя (.../iso/iso).
+    - name: Pull template files to the control node
+      shell: >-
+        set -o pipefail;
+        rsync
+        --archive
+        --partial
+        --human-readable
+        --protect-args
+        --timeout=600
+        {{ '--delete' if proxmox_template_sync_delete | bool else '' }}
+        -e {{ template_rsync_ssh_command | quote }}
+        {{ (template_rsync_remote_user ~ '@' ~ template_rsync_remote_host ~ ':' ~ item ~ '/') | quote }}
+        {{ (proxmox_template_dest_dir ~ '/' ~ (item | basename) ~ '/') | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ template_dirs_present }}"
+      loop_control:
+        label: "{{ item }}"
+      delegate_to: localhost
+      become: false
+      register: template_rsync_result
+      # Ссылка до ноды рвётся на многогигабайтных передачах: ssh ловит
+      # "message authentication code incorrect" (повреждение данных в канале) и
+      # закрывает соединение. --partial оставляет недокачанное на месте, поэтому
+      # повтор продолжает с того же места, а не начинает файл заново.
+      # Повторы здесь лечат симптом. Если срабатывают регулярно, чинить надо
+      # канал, а не плейбук.
+      until: template_rsync_result.rc == 0
+      retries: 5
+      delay: 10
+
+    - name: Measure what landed locally
+      command: du -sh "{{ proxmox_template_dest_dir }}"
+      delegate_to: localhost
+      become: false
+      register: template_local_size
+      changed_when: false
+      failed_when: false
+      when: template_dirs_present | length > 0
+
+    - name: Report result
+      debug:
+        msg: >-
+          Copied {{ template_dirs_present | join(', ') }} from {{ inventory_hostname }}
+          into {{ proxmox_template_dest_dir }}
+          ({{ template_local_size.stdout | default('size unknown') | trim }}).
+          Restore with restore_proxmox_template_files.yml after a reinstall.
+      when: template_dirs_present | length > 0

@@ -1,0 +1,156 @@
+---
+# Возврат ISO-образов и шаблонов контейнеров с control-нода на Proxmox-ноду.
+#
+# Обратная операция к backup_proxmox_template_files.yml. Нужна после
+# переустановки ноды: vzdump восстанавливает гестов, но каталоги
+# /var/lib/vz/template после чистой установки пустые.
+#
+# Копирование инкрементальное, существующие файлы на ноде не удаляются:
+# задача долить недостающее, а не привести в точное соответствие.
+#
+# Нацеливание через proxmox_target, а НЕ через --limit (--limit обрезает и
+# первый play с проверкой rsync).
+#
+# Примеры:
+#   ansible-playbook restore_proxmox_template_files.yml -e proxmox_target=pve3
+#   ansible-playbook restore_proxmox_template_files.yml -e proxmox_target=pve3 -e restore_apply=true
+
+- name: Check rsync on the control node
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check rsync on control node
+      command: rsync --version
+      register: rt_rsync_check
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if rsync is missing on control node
+      fail:
+        msg: >-
+          rsync is required on the control node to copy template files back.
+          Install it before rerunning, for example: sudo apt install rsync
+      when: rt_rsync_check.rc != 0
+
+- name: Restore ISO images and container templates
+  hosts: "{{ proxmox_target | default('pve_group') }}"
+  gather_facts: false
+  vars:
+    proxmox_ssh_user: "{{ ansible_user | default('root') }}"
+    ansible_remote_tmp: "/tmp/.ansible-{{ proxmox_ssh_user }}"
+    restore_apply: false
+    proxmox_template_src_dir: "{{ proxmox_backup_host_dir }}/{{ proxmox_backup_template_subdir }}"
+
+  tasks:
+    - name: Ensure the local backup path is configured
+      assert:
+        that:
+          - proxmox_backup_local_dir is defined
+          - proxmox_backup_local_dir | length > 0
+        fail_msg: >-
+          proxmox_backup_local_dir is not set for {{ inventory_hostname }}.
+        quiet: true
+
+    - name: Check which template directories exist in the backup
+      stat:
+        path: "{{ proxmox_template_src_dir }}/{{ item | basename }}"
+      loop: "{{ proxmox_backup_template_dirs }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      delegate_to: localhost
+      become: false
+      register: rt_src_stat
+      changed_when: false
+
+    - name: Build the list of directories to push
+      set_fact:
+        rt_dirs_present: >-
+          {{ rt_src_stat.results
+             | selectattr('stat.exists', 'equalto', true)
+             | selectattr('stat.isdir', 'equalto', true)
+             | map(attribute='item')
+             | list }}
+      changed_when: false
+
+    - name: Fail if the backup has no template directories
+      assert:
+        that: rt_dirs_present | length > 0
+        fail_msg: >-
+          Nothing to restore: {{ proxmox_template_src_dir }} has none of
+          {{ proxmox_backup_template_dirs | map('basename') | list | join(', ') }}.
+          Run backup_proxmox_template_files.yml first.
+        quiet: true
+
+    - name: Report the plan
+      debug:
+        msg: >-
+          {{ 'DRY RUN, ничего не пишется. Для применения добавь -e restore_apply=true.'
+             if not (restore_apply | bool) else 'ПРИМЕНЯЕТСЯ.' }}
+          Вернуть на {{ inventory_hostname }} из {{ proxmox_template_src_dir }}:
+          {{ rt_dirs_present | map('basename') | list | join(', ') }}.
+          Существующие файлы на ноде не удаляются.
+
+    - name: Stop here when this is a dry run
+      meta: end_host
+      when: not (restore_apply | bool)
+
+    - name: Ensure target directories exist on the node
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop: "{{ rt_dirs_present }}"
+
+    - name: Prepare rsync transfer settings
+      set_fact:
+        rt_ssh_key: >-
+          {{ (hostvars[inventory_hostname].ansible_ssh_private_key_file | default('~/.ssh/id_rsa'))
+             | regex_replace('^~', lookup('env', 'HOME')) }}
+        rt_remote_user: "{{ proxmox_ssh_user }}"
+        rt_remote_host: "{{ hostvars[inventory_hostname].ansible_host | default(inventory_hostname) }}"
+      changed_when: false
+
+    - name: Build the rsync ssh command
+      set_fact:
+        rt_ssh_command: >-
+          ssh -i {{ rt_ssh_key }}
+          -p {{ hostvars[inventory_hostname].ansible_port | default(hostvars[inventory_hostname].ansible_ssh_port | default(22)) }}
+          -o ConnectTimeout=15
+          -o BatchMode=yes
+          -o ServerAliveInterval=15
+          -o ServerAliveCountMax=4
+          -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null
+      changed_when: false
+
+    - name: Push template files back to the node
+      shell: >-
+        set -o pipefail;
+        rsync
+        --archive
+        --partial
+        --human-readable
+        --protect-args
+        --timeout=600
+        -e {{ rt_ssh_command | quote }}
+        {{ (proxmox_template_src_dir ~ '/' ~ (item | basename) ~ '/') | quote }}
+        {{ (rt_remote_user ~ '@' ~ rt_remote_host ~ ':' ~ item ~ '/') | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ rt_dirs_present }}"
+      loop_control:
+        label: "{{ item }}"
+      delegate_to: localhost
+      become: false
+      register: rt_rsync
+      until: rt_rsync.rc == 0
+      retries: 5
+      delay: 10
+
+    - name: Report result
+      debug:
+        msg: >-
+          Возвращено на {{ inventory_hostname }}: {{ rt_dirs_present | join(', ') }}.
+          Проверь, что образы видны в веб-интерфейсе Proxmox
+          (Datacenter → нода → local → ISO Images / CT Templates).
