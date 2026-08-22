@@ -37,6 +37,7 @@ ansible-playbook deploy_jenkins.yml
 | `create_*`    | a PVE node (`pve1`)     | Provision the LXC CT (`pct create`), bootstrap SSH + base packages. |
 | `deploy_*`    | the service's CT        | Install/run the service (Docker Compose) inside the CT. |
 | `connect_*`   | a PVE node (`pve1`)     | Wire integrations into Jenkins. Reaches the CTs **through the PVE node as a jump host** (`pct exec` / `pct push`). |
+| `configure_*` | network hardware        | Configure the switch and the router (see below). Not SSH-to-Linux: `network_cli` for IOS, the RouterOS API for MikroTik. |
 
 ### Why `connect_*` targets the PVE node
 
@@ -80,6 +81,42 @@ out of any public remote). Expected keys:
 - `jenkins_harbor_service_token` — Harbor robot account token.
 - `ip_rotation_release_store_password` / `ip_rotation_release_key_alias` —
   Android signing keystore secrets.
+
+## Network hardware
+
+`configure_network.yml` configures the Cisco 2960X (L2 only: VLANs, trunks,
+access ports, optional LACP) and the MikroTik router (all of L3: gateways,
+DHCP, NAT, inter-VLAN firewall). Both read the same segment map from
+`group_vars/network_group.yml`, so the topology is edited in one place.
+
+Extra requirements on the control node:
+
+```bash
+sudo apt install python3-paramiko python3-librouteros
+```
+
+Setup:
+
+1. `cp group_vars/network_group.yml.template group_vars/network_group.yml` and
+   fill in the real subnets (the committed template uses 198.18.0.0/15
+   placeholders; the real file is gitignored).
+2. `cp host_vars/_net_switch.yml.template host_vars/net_switch.yml` and the same
+   for `_net_router.yml.template`.
+3. Fill `switch_admin_login` / `switch_admin_password` /
+   `switch_enable_password` / `router_admin_login` / `router_admin_password`
+   in `secrets.yml`.
+
+```bash
+ansible-playbook configure_network.yml --check --diff   # always first
+ansible-playbook configure_network.yml --tags switch
+ansible-playbook configure_network.yml --tags router
+```
+
+Both roles reconfigure the path they are running over. They snapshot the
+current config into `net_backup_dir` (`~/net-backups` by default) before
+touching anything, but keep a console cable for the switch and MAC-winbox for
+the router within reach. The router role owns the `filter` and `nat` tables
+completely: rules absent from the templates are deleted.
 
 ## Backups
 

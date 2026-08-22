@@ -1,0 +1,66 @@
+---
+# Настройка сетевого железа лабы: Cisco 2960X (только L2) и MikroTik
+# (весь L3, файрвол, NAT, DHCP).
+#
+# Карта сегментов одна на оба устройства и лежит в group_vars/network_group.yml.
+# Роли из неё выводят и раскладку VLAN по портам свитча, и шлюзы с правилами на
+# роутере, так что топология правится в одном месте.
+#
+# Предусловия на управляющей машине (WSL):
+#   sudo apt install python3-paramiko python3-librouteros
+#
+# Предусловия на устройствах, их плейбук сделать не может, потому что до них
+# ещё нет доступа:
+#   2960X   - консольным кабелем: hostname, ip domain-name, crypto key generate
+#             rsa modulus 2048, username, line vty transport input ssh, адрес на
+#             интерфейсе Vlan управления. Плюс проверить, что свитч б/у не
+#             приехал с чужим конфигом.
+#   MikroTik - на новом роутере снести заводскую конфигурацию
+#             (/system reset-configuration no-defaults=yes), иначе рядом
+#             останутся дефолтный мост, дефолтный DHCP и заводской адрес.
+#             Потом задать пароль admin, поднять адрес на порту в сторону
+#             свитча и проверить, что служба api включена (/ip service print).
+#             Пока адреса нет, роутер доступен winbox по MAC.
+# Логины и пароли обоих устройств лежат в secrets.yml.
+#
+# Примеры:
+#   # посмотреть, что изменится, ничего не трогая
+#   ansible-playbook configure_network.yml --check --diff
+#   # только свитч
+#   ansible-playbook configure_network.yml --tags switch
+#   # только роутер
+#   ansible-playbook configure_network.yml --tags router
+#   # этап 1 из плана: создать VLAN и транки, не включая фильтрацию на роутере
+#   ansible-playbook configure_network.yml -e net_router_enable_vlan_filtering=false
+#
+# Порядок неслучаен: сначала свитч, потом роутер. Пока на свитче нет транка,
+# тегированным кадрам с роутера некуда идти.
+#
+# ⚠️ Обе роли меняют то, через что сами и работают. Первый прогон делать с
+# --check --diff, консольный кабель до свитча и winbox по MAC до роутера
+# держать под рукой. Снимки прежних конфигов роли складывают в net_backup_dir.
+
+- name: Configure the switch
+  hosts: net_switch_group
+  gather_facts: false
+  vars_files:
+    - secrets.yml
+  tags: switch
+  roles:
+    - net_switch
+
+- name: Configure the router
+  hosts: net_router_group
+  gather_facts: false
+  vars_files:
+    - secrets.yml
+  tags: router
+  module_defaults:
+    group/community.routeros.api:
+      hostname: "{{ net_router_host }}"
+      username: "{{ net_router_user }}"
+      password: "{{ net_router_password }}"
+      tls: "{{ net_router_tls }}"
+      validate_certs: false
+  roles:
+    - net_router
