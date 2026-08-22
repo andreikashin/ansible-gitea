@@ -100,12 +100,19 @@
             clone_local_archive: "{{ clone_remote_dumpdir }}/{{ clone_source_archive | basename }}"
           changed_when: false
 
+        # --append-verify вместо --whole-file: ссылка между нодами рвётся на
+        # многогигабайтных передачах (ssh ловит "message authentication code
+        # incorrect", повреждение данных в канале). При повторе --whole-file
+        # начал бы архив заново, а --append-verify сверяет уже перенесённую
+        # часть и досылает остаток. Безопасно потому, что источник это
+        # свежесозданный vzdump с уникальным именем: он не меняется во время
+        # передачи и не может быть перепутан с архивом прошлого прогона.
         - name: Pull archive from source to target
           shell: >-
             set -o pipefail;
             rsync
             --archive
-            --whole-file
+            --append-verify
             --partial
             --info=progress2
             --human-readable
@@ -118,6 +125,9 @@
             executable: /bin/bash
           register: clone_pull_result
           changed_when: clone_pull_result.rc == 0
+          until: clone_pull_result.rc == 0
+          retries: 5
+          delay: 10
 
         - name: Restore QEMU VM on target
           command:
