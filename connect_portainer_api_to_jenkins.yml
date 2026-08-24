@@ -1,0 +1,107 @@
+---
+# Заводит в Jenkins токен API портайнера как credential типа Secret text.
+#
+# Нужен пайплайну сборки дашборда: на теговой сборке он переводит стек в
+# портайнере на этот же тег. Вебхука для этого недостаточно, вебхук умеет
+# только перевыкатить текущую ссылку, а менять её умеет только API.
+#
+# Токен делается в портайнере: My account, Access tokens, Add access token.
+# Кладётся в secrets.yml строкой portainer_api_token.
+#
+# Механика та же, что у connect_portainer_webhooks_to_jenkins.yml: плей идёт
+# на ноду Proxmox и работает с контейнером Jenkins через pct, потому что
+# скрипт из init.groovy.d выполняется на старте и не требует ни аппрува, ни
+# crumb, в отличие от Script Console.
+#
+# Запуск:
+#   ansible-playbook connect_portainer_api_to_jenkins.yml
+
+- name: Seed the Portainer API token into Jenkins as a Secret text credential
+  hosts: "{{ jenkins_pve_target | default('pve1') }}"
+  become: true
+  gather_facts: false
+  vars_files:
+    - secrets.yml
+  vars:
+    jenkins_inventory_host: "{{ groups['jenkins_group'] | first }}"
+    jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
+    jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    jenkins_install_dir: "{{ jenkins_inventory_vars.jenkins_install_dir }}"
+    jenkins_http_port: "{{ jenkins_inventory_vars.jenkins_http_port }}"
+    jenkins_credentials_file: "{{ jenkins_install_dir }}/data/credentials.xml"
+    # Идентификатор должен совпадать с PORTAINER_TOKEN_ID в build.Jenkinsfile
+    # репозитория дашборда.
+    jenkins_portainer_token_id: portainer-api-token
+    jenkins_portainer_token_description: "Portainer API token for stack deploys"
+    # Одноразовый скрипт: кладётся в CT, применяется на рестарте, удаляется.
+    portainer_token_script_ct: "{{ jenkins_install_dir }}/data/init.groovy.d/41-portainer-api-token.groovy"
+    portainer_token_script_stage_pve: "/tmp/41-portainer-api-token.groovy"
+
+  tasks:
+    - name: Fail when the Portainer API token is not configured
+      assert:
+        that:
+          - portainer_api_token is defined
+          - (portainer_api_token | default('')) | length > 0
+        fail_msg: >-
+          Не задан portainer_api_token в secrets.yml. Сделай токен в портайнере
+          (My account, Access tokens) и положи его туда, затем запусти снова.
+
+    - name: Ensure the Jenkins init scripts directory exists inside the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        bash -lc 'mkdir -p {{ jenkins_install_dir }}/data/init.groovy.d'
+      changed_when: false
+
+    - name: Render the bootstrap script on the PVE node
+      template:
+        src: roles/jenkins/templates/init.groovy.d/41-portainer-api-token.groovy.j2
+        dest: "{{ portainer_token_script_stage_pve }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Push the bootstrap script into the Jenkins CT
+      command: >-
+        pct push {{ jenkins_ctid }}
+        {{ portainer_token_script_stage_pve }}
+        {{ portainer_token_script_ct }}
+        --perms 0644
+
+    - name: Remove the staged bootstrap script from the PVE node
+      file:
+        path: "{{ portainer_token_script_stage_pve }}"
+        state: absent
+
+    - name: Restart Jenkins so the credential is applied
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        bash -lc 'cd {{ jenkins_install_dir }} && docker compose restart jenkins'
+
+    - name: Wait for Jenkins HTTP to come back
+      wait_for:
+        host: "{{ jenkins_inventory_vars.jenkins_ct_ip }}"
+        port: "{{ jenkins_http_port }}"
+        timeout: 300
+
+    - name: Wait for the credential to appear in Jenkins
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        grep -q "<id>{{ jenkins_portainer_token_id }}</id>" {{ jenkins_credentials_file }}
+      register: portainer_token_ready
+      retries: 30
+      delay: 2
+      until: portainer_token_ready.rc == 0
+      changed_when: false
+
+    # Скрипт содержит сам токен, поэтому в контейнере он не остаётся.
+    - name: Remove the one-time bootstrap script from the CT
+      command: >-
+        pct exec {{ jenkins_ctid }} --
+        rm -f {{ portainer_token_script_ct }}
+      changed_when: true
+
+    - name: Report
+      debug:
+        msg:
+          - "Credential {{ jenkins_portainer_token_id }} заведён в Jenkins."
+          - "Пайплайн дашборда берёт его на стадии Deploy при сборке тега."

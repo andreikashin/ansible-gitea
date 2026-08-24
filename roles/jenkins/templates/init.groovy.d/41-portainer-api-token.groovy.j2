@@ -1,0 +1,29 @@
+import com.cloudbees.plugins.credentials.CredentialsScope
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider
+import com.cloudbees.plugins.credentials.domains.Domain
+import hudson.util.Secret
+import jenkins.model.Jenkins
+import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl
+
+def credentialsStore = SystemCredentialsProvider.getInstance().getStore()
+def globalDomain = Domain.global()
+
+def upsertCredential = { String credentialId, credential ->
+    def existingCredential = credentialsStore.getCredentials(globalDomain).find { it.id == credentialId }
+
+    if (existingCredential != null) {
+        credentialsStore.removeCredentials(globalDomain, existingCredential)
+    }
+
+    credentialsStore.addCredentials(globalDomain, credential)
+}
+
+upsertCredential({{ jenkins_portainer_token_id | to_json }}, new StringCredentialsImpl(
+    CredentialsScope.GLOBAL,
+    {{ jenkins_portainer_token_id | to_json }},
+    {{ jenkins_portainer_token_description | to_json }},
+    Secret.fromString({{ portainer_api_token | to_json }})
+))
+
+credentialsStore.save()
+Jenkins.instance.save()
