@@ -8,4 +8,10 @@ RUN apt-get update \
 
 RUN jenkins-plugin-cli --plugins workflow-aggregator credentials-binding job-dsl workflow-multibranch git pipeline-model-definition docker-workflow timestamper ws-cleanup blueocean
 
+# Multibranch discovers tags, but without this plugin it never builds them:
+# a discovered tag shows up as a job with zero builds. Kept as its own RUN so
+# adding it does not invalidate the layer above and quietly pull newer versions
+# of every other plugin on a Jenkins that serves seven projects.
+RUN jenkins-plugin-cli --plugins basic-branch-build-strategies
+
 USER jenkins
