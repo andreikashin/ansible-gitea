@@ -7,3 +7,18 @@ ansible_user: root
 # Sensitive/local destination path for fetched backups and config files.
 # Keep this in host_vars so it does not end up in the public repository.
 proxmox_backup_local_dir: 'C:\Users\blabla\Proxmox'
+
+# HP Smart Array: without ssacli the raid-smartarray probe silently returns zero.
+# lab_metrics_install_ssacli: true
+
+# Memory channels per CPU socket, used by the 70-memory probe.
+#
+# This cannot be detected: SMBIOS knows nothing about channels, and EDAC reports
+# the topology inconsistently and sometimes wrongly (it claims six channels on a
+# four-channel Broadwell, and exposes no channels at all on Skylake-SP). So the
+# fact lives here, next to the other per-node facts. Leave it out and the probe
+# simply omits the metric: a guess would be worse than silence.
+#
+# Typical values: Westmere 3, Broadwell 4, Skylake-SP 6.
+lab_metrics_extra_env:
+  MEM_CHANNELS_PER_SOCKET: 4
