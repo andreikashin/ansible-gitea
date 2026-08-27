@@ -22,3 +22,19 @@ proxmox_backup_local_dir: 'C:\Users\blabla\Proxmox'
 # Typical values: Westmere 3, Broadwell 4, Skylake-SP 6.
 lab_metrics_extra_env:
   MEM_CHANNELS_PER_SOCKET: 4
+
+  # Guests that run scheduled database dumps inside themselves, used by the
+  # 80-guest-dumps probe. node_exporter runs on the hypervisors only and guests
+  # are not scraped, so the age of the newest dump is read from the outside
+  # through the guest agent (qm) or the container exec (pct).
+  #
+  # Format is "<vmid>:<qm|pct>", space separated. Guests are listed explicitly
+  # on purpose: the node cannot know which of them keep dumps, and polling every
+  # guest hourly would hammer the agent on all the ones that do not.
+  #
+  # The convention inside a guest is /var/backups/<set>/, one series per
+  # subdirectory. Sets with different schedules must live in different
+  # directories, otherwise the frequent one keeps the directory fresh and hides
+  # a stalled rare one.
+  # DUMP_GUESTS: "101:qm 102:pct"
+
