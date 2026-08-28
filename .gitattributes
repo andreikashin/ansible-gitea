@@ -1,3 +1,13 @@
 # Shell scripts must keep LF endings — they run on Linux (agents/CTs), and a
 # CRLF shebang (`#!/usr/bin/env bash\r`) breaks execution.
 *.sh text eol=lf
+
+# Тем же концом бьют шаблоны и юниты. Конфиг, отрендеренный из .j2 с CRLF,
+# приезжает со значениями вида KEEP="56": арифметика в скрипте ломается, а
+# PG_CONTAINER="postgres" не находит контейнер. Скрипты без расширения
+# правило выше не ловит, поэтому перечислены поимённо.
+*.j2 text eol=lf
+*.service text eol=lf
+*.timer text eol=lf
+roles/pg_dump/files/pg-dump text eol=lf
+roles/gitea_backup/files/gitea-backup text eol=lf
