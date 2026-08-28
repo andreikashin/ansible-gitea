@@ -1,0 +1,69 @@
+---
+# Забирает дампы баз с гестов на рабочую станцию.
+#
+# Зачем. Дампы, которые делает deploy_db_dumps.yml, лежат на том же хосте, где
+# работает база. От удалённых данных, кривой миграции и битой таблицы это
+# защищает, а от потери всей ноды нет: копия уедет вместе с оригиналом.
+#
+# Это временная мера до PBS. Постоянное решение выглядит иначе: бэкап-сервер
+# сам тянет копии по расписанию и никого не просит. Здесь же выгрузку запускает
+# человек, и работает она ровно тогда, когда рабочая станция включена.
+#
+#   ansible-playbook -i inventory.ini fetch_db_dumps.yml
+#   ansible-playbook -i inventory.ini fetch_db_dumps.yml -e db_dumps_local_dir=/mnt/e/dumps
+#
+# Повторный запуск дешёвый: fetch сверяет контрольные суммы и качает только то,
+# чего внизу ещё нет.
+#
+# Локально ничего не удаляется. Это осознанно: на источнике ротация держит две
+# недели, а здесь копится всё, и глубина истории получается больше, чем у
+# источника. Расплата примерно 50 ГБ в год, из которых почти всё это суточные
+# архивы Gitea с репозиториями. Когда станет тесно, чистить руками.
+
+- name: Fetch database dumps to the workstation
+  hosts: portainer_group:db_group:gitea_group
+  become: true
+  gather_facts: false
+
+  vars:
+    db_dumps_local_dir: /mnt/d/backup/dumps
+    # Все дампы названы по одному образцу: <набор>-YYYYmmddTHHMMSSZ.<расширение>.
+    # Шаблон намеренно узкий, иначе под раздачу попадёт всё подряд, что система
+    # держит в /var/backups сама по себе.
+    db_dumps_pattern: '*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.*'
+
+  tasks:
+    - name: Find dump files on the guest
+      find:
+        paths: /var/backups
+        recurse: true
+        patterns: "{{ db_dumps_pattern }}"
+      register: db_dumps_found
+
+    - name: Fail when a guest that should have dumps has none
+      assert:
+        that: db_dumps_found.files | length > 0
+        fail_msg: >-
+          На {{ inventory_hostname }} не нашлось ни одного дампа в /var/backups.
+          Либо таймер не отработал ни разу, либо не прогонялся deploy_db_dumps.yml.
+          Пустая выгрузка молча выглядит как успешная, поэтому останавливаемся.
+        quiet: true
+
+    - name: Fetch them to the workstation
+      fetch:
+        src: "{{ item.path }}"
+        # Раскладываем по хосту и по набору, чтобы одинаковые имена с разных
+        # машин (globals-*.sql есть у обоих Postgres) не затирали друг друга.
+        dest: "{{ db_dumps_local_dir }}/{{ inventory_hostname }}/{{ item.path | dirname | basename }}/{{ item.path | basename }}"
+        flat: true
+        validate_checksum: true
+      loop: "{{ db_dumps_found.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    - name: Report what was taken
+      debug:
+        msg: >-
+          {{ db_dumps_found.files | length }} файлов,
+          {{ (db_dumps_found.files | map(attribute='size') | sum / 1048576) | round(1) }} MB
+          в {{ db_dumps_local_dir }}/{{ inventory_hostname }}
