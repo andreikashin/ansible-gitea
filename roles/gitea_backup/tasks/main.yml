@@ -1,0 +1,100 @@
+---
+- name: Install the backup script
+  copy:
+    src: gitea-backup
+    dest: "{{ gitea_backup_bin }}"
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create the config directory
+  file:
+    path: "{{ gitea_backup_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Write the backup config
+  template:
+    src: config.j2
+    dest: "{{ gitea_backup_config_dir }}/config"
+    owner: root
+    group: root
+    mode: '0640'
+
+- name: Install the systemd units
+  copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - gitea-backup-db.service
+    - gitea-backup-full.service
+  notify: Reload systemd
+
+- name: Install the systemd timers
+  template:
+    src: "{{ item }}.j2"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: '0644'
+  loop:
+    - gitea-backup-db.timer
+    - gitea-backup-full.timer
+  notify: Reload systemd
+
+- name: Flush handlers before enabling the timers
+  meta: flush_handlers
+
+- name: Enable and start the timers
+  systemd:
+    name: "{{ item }}"
+    enabled: true
+    state: started
+  loop:
+    - gitea-backup-db.timer
+    - gitea-backup-full.timer
+
+# Оба уровня прогоняются сразу. Полный занимает заметное время, потому что
+# читает все репозитории, но без прогона роль отчитается об успехе, ни разу не
+# проверив, что дамп вообще получается.
+- name: Run both backup levels once now
+  command: "{{ gitea_backup_bin }} {{ item }}"
+  changed_when: true
+  loop:
+    - db
+    - full
+
+- name: Look at what landed in each destination
+  find:
+    paths: "{{ item }}"
+    patterns: ['*.sqlite', '*.tar.gz']
+  register: gitea_backup_found
+  loop:
+    - "{{ gitea_backup_dest_db }}"
+    - "{{ gitea_backup_dest_full }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Verify that both levels produced a file
+  assert:
+    that:
+      - item.files | length > 0
+    fail_msg: >-
+      В {{ item.item }} пусто после прогона. Смотри journalctl на самом гесте:
+      journalctl -u gitea-backup-db.service -u gitea-backup-full.service
+    quiet: true
+  loop: "{{ gitea_backup_found.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Report the schedule
+  debug:
+    msg: >-
+      база каждые {{ gitea_backup_oncalendar_db }}, хранится
+      {{ gitea_backup_keep_db }}; полный дамп {{ gitea_backup_oncalendar_full }},
+      хранится {{ gitea_backup_keep_full }}

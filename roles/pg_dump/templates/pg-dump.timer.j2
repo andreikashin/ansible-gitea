@@ -1,0 +1,12 @@
+[Unit]
+Description=Дампы Postgres по расписанию
+
+[Timer]
+OnCalendar={{ pg_dump_oncalendar }}
+# Пропущенный прогон (машина была выключена) выполняется при старте, а не
+# теряется до следующего срока.
+Persistent=true
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,93 @@
+---
+# Дампы делаются ВНУТРИ геста, потому что Postgres живёт в контейнере на нём.
+# Снаружи, с гипервизора, до базы не дотянуться, а бэкап виртуалки снимает
+# работающий Postgres поблочно и в crash-consistent состоянии.
+
+- name: Install the dump script
+  copy:
+    src: pg-dump
+    dest: "{{ pg_dump_bin }}"
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Create the config directory
+  file:
+    path: "{{ pg_dump_config_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Write the dump config
+  template:
+    src: config.j2
+    dest: "{{ pg_dump_config_dir }}/config"
+    owner: root
+    group: root
+    mode: '0640'
+
+- name: Install the systemd unit
+  copy:
+    src: pg-dump.service
+    dest: /etc/systemd/system/pg-dump.service
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+
+- name: Install the systemd timer
+  template:
+    src: pg-dump.timer.j2
+    dest: /etc/systemd/system/pg-dump.timer
+    owner: root
+    group: root
+    mode: '0644'
+  notify: Reload systemd
+
+- name: Flush handlers before enabling the timer
+  meta: flush_handlers
+
+- name: Enable and start the timer
+  systemd:
+    name: pg-dump.timer
+    enabled: true
+    state: started
+
+# Первый прогон делается сразу, а не через шесть часов. Без него роль
+# отчитывается об успехе, а работает ли она на самом деле, выяснится только
+# вечером, и то если кто-то посмотрит.
+- name: Run the dump once now
+  command: "{{ pg_dump_bin }}"
+  changed_when: true
+
+- name: List what landed in the destination
+  find:
+    paths: "{{ pg_dump_dest }}"
+    patterns:
+      - '*.dump'
+      - '*.sql'
+  register: pg_dump_files
+
+# Проверяем не только базы, но и globals. Роли, их пароли и права живут на
+# уровне кластера и в дамп ОТДЕЛЬНОЙ базы не попадают. Восстановление в чистый
+# Postgres без них падает на первом же "role does not exist", и обнаруживается
+# это в худший возможный момент.
+- name: Verify that both the globals and at least one database were dumped
+  vars:
+    pg_dump_names: "{{ pg_dump_files.files | map(attribute='path') | map('basename') | list }}"
+  assert:
+    that:
+      - pg_dump_names | select('match', '^globals-') | list | length > 0
+      - pg_dump_names | reject('match', '^globals-') | list | length > 0
+    fail_msg: >-
+      Прогон завершился, но в {{ pg_dump_dest }} нет полного набора.
+      Найдено: {{ pg_dump_names | join(', ') | default('ничего', true) }}.
+      Смотри journalctl -u pg-dump.service на самом гесте.
+    quiet: true
+
+- name: Report what is being dumped
+  debug:
+    msg: >-
+      {{ pg_dump_files.files | length }} файлов в {{ pg_dump_dest }},
+      расписание {{ pg_dump_oncalendar }}, хранится {{ pg_dump_keep }} на набор

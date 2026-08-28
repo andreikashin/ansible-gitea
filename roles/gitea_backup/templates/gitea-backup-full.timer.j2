@@ -1,0 +1,12 @@
+[Unit]
+Description=Полный дамп Gitea по расписанию
+
+[Timer]
+OnCalendar={{ gitea_backup_oncalendar_full }}
+Persistent=true
+# Разброс больше, чем у лёгкого уровня: полный дамп читает все репозитории и
+# заметно грузит диск, поэтому пусть не совпадает с соседними задачами.
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

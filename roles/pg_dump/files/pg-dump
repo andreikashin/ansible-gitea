@@ -1,0 +1,111 @@
+#!/bin/sh
+# Логические дампы всех баз одного экземпляра Postgres.
+#
+# Зачем это поверх бэкапа виртуалки. Снимок ВМ блочный: он копирует диск, не
+# спрашивая базу, и ловит работающий Postgres на полуслове. Такая копия почти
+# всегда поднимается, доиграв журнал, но гарантии нет, а выяснится это ровно в
+# тот момент, когда копия понадобится. Дамп консистентен на уровне приложения:
+# pg_dump открывает одну транзакцию и видит базу одним моментом времени, даже
+# если во время выгрузки идут записи.
+#
+# Дамп делается ДВУМЯ частями, и вторая обычно и забывается:
+#
+#   globals  Роли, их пароли и права живут на уровне кластера, а не внутри
+#            базы. В дамп отдельной базы они НЕ попадают. Восстановление в
+#            чистый Postgres без них падает на первом же "role does not exist",
+#            и обнаруживается это в худший возможный момент.
+#
+#   базы     Каждая отдельным файлом в формате -Fc: сжат, читается более новой
+#            версией Postgres (то есть годится как payload для переезда) и
+#            позволяет восстановить одну базу или одну таблицу вместо всего.
+#
+# Список баз спрашивается у самого Postgres, а не берётся из конфига. База,
+# заведённая руками и забытая в конфиге, это ровно та база, которую потом не
+# найдут в бэкапе.
+
+set -eu
+umask 077
+
+CONFIG=${CONFIG:-/etc/pg-dump/config}
+# shellcheck source=/dev/null
+[ -r "$CONFIG" ] && . "$CONFIG"
+
+DOCKER=${DOCKER:-/usr/bin/docker}
+PG_CONTAINER=${PG_CONTAINER:?PG_CONTAINER не задан в $CONFIG}
+PG_SUPERUSER=${PG_SUPERUSER:?PG_SUPERUSER не задан в $CONFIG}
+DEST=${DEST:-/var/backups/pg}
+KEEP=${KEEP:-56}
+# База, через которую делается служебное подключение. Без явного указания psql
+# лезет в базу, названную по имени пользователя, и на инстансе, где суперюзер
+# зовётся не postgres, соединение не открывается вовсе.
+PG_MAINT_DB=${PG_MAINT_DB:-postgres}
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$DEST"
+fail=0
+
+# Общий приём для обоих видов дампа: пишем во временный файл и переименовываем
+# только после проверки. Оборванный дамп не должен выглядеть готовым, иначе
+# ротация посчитает его за копию и вытеснит настоящую.
+
+tmp="$DEST/.globals-$stamp.sql.part"
+if "$DOCKER" exec "$PG_CONTAINER" pg_dumpall --globals-only -U "$PG_SUPERUSER" \
+     -l "$PG_MAINT_DB" > "$tmp" 2>/dev/null && [ -s "$tmp" ]; then
+  mv "$tmp" "$DEST/globals-$stamp.sql"
+else
+  rm -f "$tmp"
+  echo "globals dump failed" >&2
+  fail=1
+fi
+
+list="$DEST/.dblist.$$"
+trap 'rm -f "$list"' EXIT
+
+if ! "$DOCKER" exec "$PG_CONTAINER" psql -U "$PG_SUPERUSER" -d "$PG_MAINT_DB" -Atc \
+     'select datname from pg_database where not datistemplate and datallowconn order by 1' \
+     > "$list" 2>/dev/null; then
+  echo "cannot list databases" >&2
+  exit 1
+fi
+
+# Через перенаправление, а не через конвейер: тело цикла выставляет fail, а в
+# конвейере оно ушло бы в подоболочку и результат потерялся.
+while IFS= read -r db; do
+  [ -n "$db" ] || continue
+  tmp="$DEST/.$db-$stamp.dump.part"
+
+  if ! "$DOCKER" exec "$PG_CONTAINER" pg_dump -Fc -U "$PG_SUPERUSER" "$db" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    echo "dump failed: $db" >&2
+    fail=1
+    continue
+  fi
+
+  # Проверка сигнатуры намеренно через подстановку, а не "head | grep -q": в
+  # конвейере ранний выход grep роняет источник по SIGPIPE, конвейер отдаёт
+  # 141, и проверка начинает врать.
+  if [ ! -s "$tmp" ] || [ "$(head -c 5 "$tmp")" != "PGDMP" ]; then
+    rm -f "$tmp"
+    echo "bad archive: $db" >&2
+    fail=1
+    continue
+  fi
+
+  mv "$tmp" "$DEST/$db-$stamp.dump"
+done < "$list"
+
+# Ротация по числу файлов на каждый префикс отдельно, а не по возрасту. Если
+# таймер простоит две недели, ротация по возрасту снесёт всё, включая
+# единственную уцелевшую копию. Метка времени в UTC и ISO, поэтому
+# лексикографический порядок совпадает с хронологическим.
+prefixes="$(ls -1 "$DEST" 2>/dev/null |
+  sed -n 's/^\(.*\)-[0-9]\{8\}T[0-9]\{6\}Z\.\(dump\|sql\)$/\1/p' | sort -u)"
+
+for p in $prefixes; do
+  ls -1 "$DEST/$p-"*.dump "$DEST/$p-"*.sql 2>/dev/null | sort | head -n "-$KEEP" |
+  while IFS= read -r old; do
+    rm -f "$old"
+  done
+done
+
+exit "$fail"

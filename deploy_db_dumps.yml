@@ -1,0 +1,28 @@
+---
+# Логические дампы баз, которые невозможно пересобрать заново.
+#
+# Зачем это поверх бэкапа виртуалки: снимок ВМ блочный, он копирует диск, не
+# спрашивая базу, и ловит работающий движок на полуслове. Такая копия почти
+# всегда поднимается, доиграв журнал, но гарантии нет, а выясняется это ровно
+# в тот момент, когда копия понадобится.
+#
+# Дампы кладутся на тот же хост, где живёт база. От случайного удаления, от
+# битой миграции и от испорченной таблицы это защищает, от потери всей ноды
+# нет: за это отвечает бэкап-сервер, который забирает каталог наружу.
+#
+#   ansible-playbook -i inventory.ini deploy_db_dumps.yml
+#   ansible-playbook -i inventory.ini deploy_db_dumps.yml --limit gitea_node
+
+- name: Dump Postgres instances on a schedule
+  hosts: portainer_group:db_group
+  become: true
+  gather_facts: true
+  roles:
+    - pg_dump
+
+- name: Back up Gitea on a schedule
+  hosts: gitea_group
+  become: true
+  gather_facts: true
+  roles:
+    - gitea_backup

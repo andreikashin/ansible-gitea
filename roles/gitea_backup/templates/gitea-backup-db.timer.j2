@@ -1,0 +1,10 @@
+[Unit]
+Description=Копия базы Gitea по расписанию
+
+[Timer]
+OnCalendar={{ gitea_backup_oncalendar_db }}
+Persistent=true
+RandomizedDelaySec=180
+
+[Install]
+WantedBy=timers.target

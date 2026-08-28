@@ -1,0 +1,118 @@
+#!/bin/sh
+# Бэкап Gitea. Два уровня, потому что они защищают от разного.
+#
+#   db    Копия SQLite штатным онлайн-бэкапом. Четыре мегабайта, снимается
+#         мгновенно и без остановки сервиса. Внутри всё, чего нет больше нигде:
+#         issues, пользователи, токены, вебхуки, настройки организаций.
+#         Репозиториев здесь НЕТ, они лежат файлами рядом.
+#
+#   full  gitea dump: база в виде SQL, репозитории, конфиг и аватары одним
+#         архивом. Артефакт полного восстановления, но на порядок тяжелее,
+#         поэтому раз в сутки.
+#
+# Почему не обычный cp файла gitea.db. SQLite пишет страницами, и копия,
+# снятая во время записи, приезжает разорванной посередине транзакции. Команда
+# ".backup" использует онлайн-API SQLite и даёт согласованный снимок живой
+# базы, ровно как pg_dump для Postgres.
+#
+# Полный дамп пишется в stdout (--file -), а не во временный файл внутри
+# контейнера: не нужен docker cp и не остаётся мусора, если прогон оборвался.
+
+set -eu
+umask 077
+
+CONFIG=${CONFIG:-/etc/gitea-backup/config}
+# shellcheck source=/dev/null
+[ -r "$CONFIG" ] && . "$CONFIG"
+
+DOCKER=${DOCKER:-/usr/bin/docker}
+GITEA_CONTAINER=${GITEA_CONTAINER:-gitea}
+GITEA_DB=${GITEA_DB:-/data/gitea/gitea.db}
+# Два уровня лежат в РАЗНЫХ каталогах намеренно. Мониторинг смотрит на возраст
+# свежего файла в каталоге, и если сложить их вместе, шестичасовые копии базы
+# будут вечно освежать каталог и замаскируют застрявший суточный дамп.
+DEST_DB=${DEST_DB:-/var/backups/gitea-db}
+DEST_FULL=${DEST_FULL:-/var/backups/gitea-full}
+KEEP_DB=${KEEP_DB:-56}
+KEEP_FULL=${KEEP_FULL:-14}
+
+mode=${1:?usage: gitea-backup db|full}
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+
+# Ротация по числу файлов, а не по возрасту: если таймер простоит две недели,
+# ротация по возрасту снесёт всё, включая единственную уцелевшую копию. Метка
+# времени в UTC и ISO, поэтому лексикографический порядок равен хронологии.
+# $1 каталог, $2 префикс, $3 расширение, $4 сколько оставить
+rotate() {
+  ls -1 "$1/$2-"*".$3" 2>/dev/null | sort | head -n "-$4" | while IFS= read -r old; do
+    rm -f "$old"
+  done
+}
+
+case "$mode" in
+  db)
+    mkdir -p "$DEST_DB"
+    tmp="$DEST_DB/.gitea-db-$stamp.sqlite.part"
+    inner=/tmp/gitea-backup.db
+
+    "$DOCKER" exec "$GITEA_CONTAINER" sqlite3 "$GITEA_DB" ".backup $inner"
+
+    # Проверяем копию ДО того, как вытащить её наружу: sqlite3 живёт в
+    # контейнере, а на хосте контейнера его может не быть.
+    check="$("$DOCKER" exec "$GITEA_CONTAINER" sqlite3 "$inner" 'pragma integrity_check')"
+    if [ "$check" != "ok" ]; then
+      "$DOCKER" exec "$GITEA_CONTAINER" rm -f "$inner" || true
+      echo "integrity_check: $check" >&2
+      exit 1
+    fi
+
+    want="$("$DOCKER" exec "$GITEA_CONTAINER" stat -c %s "$inner")"
+    "$DOCKER" cp "$GITEA_CONTAINER:$inner" "$tmp"
+    "$DOCKER" exec "$GITEA_CONTAINER" rm -f "$inner"
+
+    # docker cp наследует права исходного файла и игнорирует umask, а внутри
+    # хеши паролей и токены доступа. Ужимаем явно.
+    chmod 0600 "$tmp"
+
+    # Вторая проверка уже снаружи, на случай оборванного docker cp. Заголовок
+    # читаем подстановкой, а не "head | grep": в конвейере ранний выход grep
+    # роняет источник по SIGPIPE, и проверка начинает врать. Размер сверяем с
+    # исходным, потому что усечённая копия заголовок пройдёт.
+    got="$(stat -c %s "$tmp" 2>/dev/null || echo 0)"
+    if [ "$got" != "$want" ] || [ "$(head -c 15 "$tmp")" != "SQLite format 3" ]; then
+      rm -f "$tmp"
+      echo "bad copy: got $got bytes, want $want" >&2
+      exit 1
+    fi
+
+    mv "$tmp" "$DEST_DB/gitea-db-$stamp.sqlite"
+    rotate "$DEST_DB" gitea-db sqlite "$KEEP_DB"
+    echo "$DEST_DB/gitea-db-$stamp.sqlite"
+    ;;
+
+  full)
+    mkdir -p "$DEST_FULL"
+    tmp="$DEST_FULL/.gitea-full-$stamp.tar.gz.part"
+
+    # -u git: данные принадлежат пользователю git, под root gitea ругается.
+    "$DOCKER" exec -u git "$GITEA_CONTAINER" \
+      gitea dump --file - --type tar.gz --skip-log -q > "$tmp"
+
+    # gzip -t ловит обрыв потока. Архив едет по конвейеру, и прерванная
+    # передача даёт формально существующий, но неполный файл.
+    if ! gzip -t "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      echo "archive is broken" >&2
+      exit 1
+    fi
+
+    mv "$tmp" "$DEST_FULL/gitea-full-$stamp.tar.gz"
+    rotate "$DEST_FULL" gitea-full tar.gz "$KEEP_FULL"
+    echo "$DEST_FULL/gitea-full-$stamp.tar.gz"
+    ;;
+
+  *)
+    echo "usage: gitea-backup db|full" >&2
+    exit 2
+    ;;
+esac

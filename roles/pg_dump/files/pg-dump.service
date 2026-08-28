@@ -1,0 +1,9 @@
+[Unit]
+Description=Логические дампы всех баз Postgres
+Documentation=file:/usr/local/bin/pg-dump
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pg-dump

@@ -1,0 +1,9 @@
+[Unit]
+Description=Полный дамп Gitea (база, репозитории, конфиг)
+Documentation=file:/usr/local/bin/gitea-backup
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gitea-backup full
