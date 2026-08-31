@@ -199,6 +199,48 @@ until every node reports `Ready` and asserts that the set of node names matches
 the inventory. It then writes a kubeconfig to the control node with the server
 address rewritten, since k3s puts `127.0.0.1` in the file.
 
+## Object storage
+
+`create_minio.yml` clones the Ubuntu cloud template into a guest and attaches the
+data disks; `deploy_minio.yml` installs MinIO into it and creates the buckets.
+
+```bash
+cp host_vars/_minio_node.yml.template host_vars/minio_node.yml   # fill in, gitignored
+# add the host to [minio_group] in inventory.ini
+
+ansible-playbook -i inventory.ini create_minio.yml -e minio_pve_target=pveX
+ansible-playbook -i inventory.ini deploy_minio.yml
+```
+
+Data lives on one disk per device, not on a single large one. MinIO spreads
+erasure coding across drives, and with a single drive there is no erasure coding
+at all, only a copy. Four drives give EC:2. The disks are mounted by their
+`by-id` path rather than `/dev/sdb`: kernel naming depends on discovery order and
+changes between boots, and MinIO refuses to start when the drives come back in a
+different order.
+
+The server is **built from source** rather than installed from a package, and the
+reason is worth knowing. The last MinIO release with published artifacts (deb,
+rpm, container image) is 2025-09-07. The next one, 2025-10-15, fixes a privilege
+escalation CVE in service accounts and STS session policies, but no binaries were
+published for it: the release notes suggest `go install` or building the image
+yourself. There have been no releases since. Installing the package would mean
+knowingly putting a known hole into the store that will hold artifacts and
+backups, so the role pins the fixed tag and compiles it. The build takes a few
+minutes.
+
+A binary produced by `go install` does not know its own version, because MinIO
+stamps that via ldflags at release build time, so the role records the installed
+version in a marker file next to the binary. Without it, bumping `minio_version`
+would silently not rebuild.
+
+There is no web console. The embedded UI was moved out of the community build in
+2025, along with LDAP and OIDC login, so everything is managed through `mc`.
+
+The last play checks what the store is for rather than whether the process is up:
+that every drive is online and the backend really is in erasure mode, and that an
+object can be written, read back byte for byte, and deleted.
+
 ## Backups
 
 `backup_proxmox_vms.yml` backs up Proxmox guests (both QEMU VMs and LXC CTs) via

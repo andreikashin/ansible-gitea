@@ -1,0 +1,199 @@
+---
+# Создание геста под объектное хранилище клонированием облачного шаблона.
+#
+# Размещение по §5 плана: объектное хранилище живёт на ноде с корзинами, потому
+# что это единственный компонент стека, которому нужен именно объём дисков, а не
+# память или латентность. Этот плейбук от ноды не зависит: сколько дисков и
+# какого размера, берётся из host_vars, так что обкатать можно на любой ноде, а
+# потом развернуть там, где корзины.
+#
+# Диски под данные заводятся отдельными виртуальными дисками, а не одним
+# большим. Причина не в аккуратности: MinIO раскладывает erasure-код по дискам,
+# и на одном диске erasure-кода нет вообще, только копия. Четыре диска дают
+# EC:2. На ноде с настоящими корзинами вместо нарезки из пула сюда пробрасывают
+# сами диски, но со стороны гостя картина та же.
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini create_minio.yml
+#   ansible-playbook -i inventory.ini create_minio.yml -e minio_pve_target=pveX
+
+- name: Provision the object storage guest on Proxmox
+  hosts: "{{ minio_pve_target | default('pve2') }}"
+  become: true
+  gather_facts: false
+  vars:
+    minio_host: "{{ groups['minio_group'] | first }}"
+    mn: "{{ hostvars[groups['minio_group'] | first] }}"
+    minio_ssh_pubkey_file: "~/.ssh/id_rsa.pub"
+    minio_template_name: u24s-cloud-tmpl
+    minio_template_autobuild: true
+    minio_bridge: vmbr0
+    minio_cloud_image_url: "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+    minio_cloud_image_path: "/var/lib/vz/template/iso/{{ minio_cloud_image_url | basename }}"
+
+  tasks:
+    - name: Fail if the host_vars point at another node
+      assert:
+        that: mn.minio_pve_target == inventory_hostname
+        fail_msg: >-
+          host_vars просят {{ mn.minio_pve_target }}, а плейбук идёт на
+          {{ inventory_hostname }}. Передай нужную через -e minio_pve_target=...
+        quiet: true
+
+    - name: Check whether the source template exists
+      command: "qm config {{ mn.minio_template_vmid }}"
+      register: minio_tmpl
+      changed_when: false
+      failed_when: false
+
+    - name: Fail if the template is missing and autobuild is off
+      assert:
+        that: minio_tmpl.rc == 0 or (minio_template_autobuild | bool)
+        fail_msg: >-
+          Шаблона {{ mn.minio_template_vmid }} на {{ inventory_hostname }} нет, а
+          minio_template_autobuild=false.
+        quiet: true
+
+    # Шаблоны не общие между нодами Proxmox, а на только что переустановленной
+    # их нет вовсе. Собираем из официального облачного образа.
+    - name: Build the cloud-init template from the official image
+      when:
+        - minio_tmpl.rc != 0
+        - minio_template_autobuild | bool
+      block:
+        - name: Download the Ubuntu cloud image
+          get_url:
+            url: "{{ minio_cloud_image_url }}"
+            dest: "{{ minio_cloud_image_path }}"
+            mode: '0644'
+
+        - name: Create the template VM shell
+          command: >-
+            qm create {{ mn.minio_template_vmid }} --name {{ minio_template_name }}
+            --memory 2048 --cores 2 --cpu host
+            --net0 virtio,bridge={{ minio_bridge }}
+            --scsihw virtio-scsi-single --ostype l26 --agent 1
+
+        - name: Import the cloud image as the boot disk
+          command: >-
+            qm set {{ mn.minio_template_vmid }}
+            --scsi0 {{ mn.minio_storage }}:0,import-from={{ minio_cloud_image_path }}
+
+        - name: Attach the cloud-init drive, boot order and serial console
+          command: >-
+            qm set {{ mn.minio_template_vmid }}
+            --ide2 {{ mn.minio_storage }}:cloudinit
+            --boot order=scsi0 --serial0 socket --vga serial0
+
+        - name: Convert the VM into a template
+          command: "qm template {{ mn.minio_template_vmid }}"
+
+    - name: Check whether the target VMID is already taken
+      command: "qm config {{ mn.minio_vmid }}"
+      register: minio_existing
+      changed_when: false
+      failed_when: false
+
+    - name: Check that the target address is not answering already
+      command: "ping -c 2 -W 1 {{ mn.minio_ip }}"
+      register: minio_ping
+      changed_when: false
+      failed_when: false
+      when: minio_existing.rc != 0
+
+    - name: Fail if the address is taken by something else
+      assert:
+        that: minio_ping.rc != 0
+        fail_msg: >-
+          {{ mn.minio_ip }} отвечает на ping, а геста {{ mn.minio_vmid }} ещё нет.
+          Октет занят кем-то другим.
+        quiet: true
+      when: minio_existing.rc != 0
+
+    - name: Put the control node public key where qm can read it
+      copy:
+        content: "{{ lookup('file', minio_ssh_pubkey_file) }}\n"
+        dest: /tmp/ansible-minio.pub
+        mode: '0600'
+
+    - name: Clone the template
+      command:
+        argv:
+          - qm
+          - clone
+          - "{{ mn.minio_template_vmid }}"
+          - "{{ mn.minio_vmid }}"
+          - --name
+          - "{{ mn.minio_vm_name }}"
+          - --full
+          - "1"
+          - --storage
+          - "{{ mn.minio_storage }}"
+      when: minio_existing.rc != 0
+
+    - name: Apply resources, addressing and the ssh key
+      command:
+        argv:
+          - qm
+          - set
+          - "{{ mn.minio_vmid }}"
+          - --cores
+          - "{{ mn.minio_cores }}"
+          - --sockets
+          - "1"
+          - --memory
+          - "{{ mn.minio_memory }}"
+          - --onboot
+          - "1"
+          - --agent
+          - "1"
+          - --ciuser
+          - "{{ mn.ansible_user }}"
+          - --sshkeys
+          - /tmp/ansible-minio.pub
+          - --ipconfig0
+          - "ip={{ mn.minio_ip }}/{{ mn.minio_cidr }},gw={{ mn.minio_gateway }}"
+          - --nameserver
+          - "{{ mn.minio_nameserver }}"
+      when: minio_existing.rc != 0
+
+    - name: Grow the root disk
+      command: "qm resize {{ mn.minio_vmid }} scsi0 +{{ mn.minio_disk_grow }}"
+      when: minio_existing.rc != 0
+
+    # Диски заводятся по одному и с фиксированными именами scsi1..scsiN, чтобы
+    # в госте они опознавались по by-id, а не по порядку появления sdb, sdc.
+    # Порядок sd* меняется от загрузки к загрузке, и MinIO при перепутанных
+    # дисках отказывается стартовать.
+    - name: Read the current guest config
+      command: "qm config {{ mn.minio_vmid }}"
+      register: minio_conf
+      changed_when: false
+
+    - name: Attach the data disks
+      command: >-
+        qm set {{ mn.minio_vmid }}
+        --scsi{{ item }} {{ mn.minio_storage }}:{{ mn.minio_data_disk_size }},backup=0
+      loop: "{{ range(1, (mn.minio_data_disks | int) + 1) | list }}"
+      when: "'scsi' ~ item ~ ':' not in minio_conf.stdout"
+
+    - name: Start the guest
+      command: "qm start {{ mn.minio_vmid }}"
+      register: minio_start
+      changed_when: "'already running' not in minio_start.stderr"
+      failed_when: minio_start.rc != 0 and 'already running' not in minio_start.stderr
+
+    - name: Wait for SSH on the new guest
+      wait_for:
+        host: "{{ mn.minio_ip }}"
+        port: 22
+        timeout: 300
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      debug:
+        msg:
+          - "Гест {{ mn.minio_vm_name }} ({{ mn.minio_vmid }}) на {{ inventory_hostname }}, адрес {{ mn.minio_ip }}."
+          - "Дисков под данные: {{ mn.minio_data_disks }} по {{ mn.minio_data_disk_size }} ГиБ."
+          - "Дальше: ansible-playbook -i inventory.ini deploy_minio.yml"

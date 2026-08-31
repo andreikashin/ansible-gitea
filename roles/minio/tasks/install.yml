@@ -1,0 +1,117 @@
+---
+# Собранный через go install бинарь не знает своей версии: MinIO проставляет её
+# ldflags при релизной сборке, а go install их не передаёт, и minio --version
+# отвечает DEVELOPMENT.GOGET. Поэтому версию рядом записываем сами, иначе
+# смена minio_version молча не приводила бы к пересборке.
+- name: Read the installed version marker
+  slurp:
+    src: "{{ minio_version_marker }}"
+  register: minio_marker
+  failed_when: false
+  changed_when: false
+
+- name: Remember the installed version
+  set_fact:
+    minio_current_version: >-
+      {{ (minio_marker.content | b64decode | trim) if (minio_marker.content is defined) else '' }}
+
+# Сборка из исходников, а не пакет. Почему именно так, написано в defaults:
+# у последнего релиза с закрытой CVE нет опубликованных артефактов.
+- name: Build the pinned MinIO release
+  when: minio_current_version != minio_version
+  block:
+    - name: Read the installed Go version
+      command: /usr/local/go/bin/go version
+      register: minio_go_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Download the Go toolchain
+      get_url:
+        url: "{{ minio_go_url }}"
+        dest: "/tmp/go{{ minio_go_version }}.tar.gz"
+        mode: '0644'
+      when: "'go' ~ minio_go_version not in (minio_go_installed.stdout | default(''))"
+
+    - name: Unpack the Go toolchain
+      unarchive:
+        src: "/tmp/go{{ minio_go_version }}.tar.gz"
+        dest: /usr/local
+        remote_src: true
+      when: "'go' ~ minio_go_version not in (minio_go_installed.stdout | default(''))"
+
+    - name: Create the build directory
+      file:
+        path: "{{ minio_build_dir }}"
+        state: directory
+        mode: '0755'
+
+    # Сборка занимает единицы минут. Держим её отдельным шагом с явным GOPATH,
+    # чтобы кеш модулей не расползался по домашним каталогам.
+    - name: Build the server
+      command: "/usr/local/go/bin/go install github.com/minio/minio@{{ minio_version }}"
+      environment:
+        GOPATH: "{{ minio_build_dir }}"
+        GOCACHE: "{{ minio_build_dir }}/cache"
+        GOTOOLCHAIN: local
+        HOME: "{{ minio_build_dir }}"
+
+    - name: Put the server binary in place
+      copy:
+        src: "{{ minio_build_dir }}/bin/minio"
+        dest: "{{ minio_bin }}"
+        mode: '0755'
+        remote_src: true
+      notify: Restart MinIO
+
+    - name: Record which version is installed
+      copy:
+        content: "{{ minio_version }}
+"
+        dest: "{{ minio_version_marker }}"
+        mode: '0644'
+
+- name: Read the installed client version
+  command: "{{ minio_mc_bin }} --version"
+  register: minio_mc_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install the client
+  get_url:
+    url: "{{ minio_mc_url }}"
+    dest: "{{ minio_mc_bin }}"
+    mode: '0755'
+  when: minio_mc_installed.rc != 0 or minio_mc_version not in minio_mc_installed.stdout
+
+- name: Install the environment file
+  template:
+    src: minio.env.j2
+    dest: /etc/default/minio
+    owner: root
+    group: "{{ minio_service_user }}"
+    mode: '0640'
+  notify: Restart MinIO
+
+- name: Install the systemd unit
+  template:
+    src: minio.service.j2
+    dest: /etc/systemd/system/minio.service
+    mode: '0644'
+  notify: Restart MinIO
+
+- name: Ensure the service is enabled and running
+  systemd:
+    name: minio
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Apply pending restarts before touching the API
+  meta: flush_handlers
+
+- name: Wait for the S3 endpoint
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ minio_api_port }}"
+    timeout: 180

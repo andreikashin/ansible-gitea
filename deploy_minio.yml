@@ -1,0 +1,95 @@
+---
+# Ставит и настраивает MinIO в гест, созданный create_minio.yml.
+#
+# Про версию отдельно, потому что это не обычное закрепление. Последний релиз
+# MinIO с опубликованными артефактами это 2025-09-07. Следующий, 2025-10-15,
+# закрывает CVE с эскалацией привилегий, но бинарей к нему не выложили, а
+# дальше релизов не было вовсе. Поэтому роль собирает сервер из исходников на
+# закреплённом теге: ставить пакет значит осознанно занести дыру в хранилище,
+# где будут артефакты и бэкапы. Сборка занимает единицы минут.
+#
+# Диски. Каждый отдельным устройством и опознаётся по by-id: MinIO раскладывает
+# erasure-код по дискам, а порядок sdb, sdc от загрузки к загрузке меняется, и
+# на перепутанных дисках сервер не стартует.
+#
+# Чего плейбук не делает: не выпускает сертификат и не выставляет хранилище
+# наружу. S3 слушает LAN по http, TLS будет на traefik, когда до этого дойдёт
+# очередь.
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini create_minio.yml   # один раз, создаёт гест
+#   ansible-playbook -i inventory.ini deploy_minio.yml   # сервер и бакеты
+
+- name: Deploy the object storage
+  hosts: minio_group
+  become: true
+
+  pre_tasks:
+    # cloud-init на свежем госте держит замок apt.
+    - name: Wait for cloud-init to finish
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+  roles:
+    - minio
+
+  post_tasks:
+    # Проверяем то, ради чего хранилище существует: что объект кладётся,
+    # читается обратно байт в байт и удаляется. И что erasure-набор собрался из
+    # всех дисков, а не из одного.
+    - name: Read the cluster state
+      command: "{{ minio_mc_bin }} admin info lab --json"
+      register: minio_info
+      changed_when: false
+
+    - name: Check that every drive is online
+      vars:
+        info: "{{ minio_info.stdout | from_json }}"
+      assert:
+        that:
+          - info.info.backend.onlineDisks | int == minio_data_disks | int
+          - info.info.backend.offlineDisks | int == 0
+          - info.info.backend.backendType == 'Erasure'
+        fail_msg: >-
+          Диски собрались не так. Онлайн: {{ info.info.backend.onlineDisks }},
+          офлайн: {{ info.info.backend.offlineDisks }},
+          режим: {{ info.info.backend.backendType }}.
+        quiet: true
+
+    - name: Write a probe object
+      copy:
+        content: "minio smoke test\n"
+        dest: /tmp/minio-probe
+        mode: '0600'
+
+    - name: Put the probe object
+      command: "{{ minio_mc_bin }} cp /tmp/minio-probe lab/{{ minio_buckets | first }}/ansible-probe"
+      changed_when: false
+
+    - name: Read it back
+      command: "{{ minio_mc_bin }} cat lab/{{ minio_buckets | first }}/ansible-probe"
+      register: minio_probe
+      changed_when: false
+
+    - name: Check the object came back intact
+      assert:
+        that: minio_probe.stdout == 'minio smoke test'
+        fail_msg: "Объект прочитался не тем, чем записан: {{ minio_probe.stdout | truncate(80) }}"
+        quiet: true
+
+    - name: Remove the probe object
+      command: "{{ minio_mc_bin }} rm lab/{{ minio_buckets | first }}/ansible-probe"
+      changed_when: false
+
+    - name: Where things are
+      vars:
+        info: "{{ minio_info.stdout | from_json }}"
+      debug:
+        msg:
+          - "S3:       http://{{ ansible_host }}:{{ minio_api_port }}"
+          - "Дисков:   {{ info.info.backend.onlineDisks }} онлайн, режим {{ info.info.backend.backendType }}, чётность {{ info.info.backend.standardSCParity }}"
+          - "Бакеты:   {{ minio_buckets | join(', ') }}"
+          - "Учётки:   {{ minio_root_user }} (админ), {{ minio_apps | map(attribute='name') | join(', ') }} (по политике на свои бакеты), пароли в host_vars"
+          - "Клиент:   mc alias set <имя> http://{{ ansible_host }}:{{ minio_api_port }} <учётка> <пароль>"
+          - "Консоли нет: встроенный веб-интерфейс вынесен из community-сборки, управление через mc"

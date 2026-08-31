@@ -1,0 +1,79 @@
+---
+# Бакеты, политики и учётки заводятся клиентом. Всё здесь идёт под root, но
+# приложения ей не пользуются: у каждого своя учётка с политикой ровно на его
+# бакеты. Root остаётся у оператора.
+
+- name: Register the local alias
+  command: >-
+    {{ minio_mc_bin }} alias set lab
+    http://127.0.0.1:{{ minio_api_port }} {{ minio_root_user }} {{ minio_root_password }}
+  changed_when: false
+  no_log: true
+
+- name: Read the existing buckets
+  command: "{{ minio_mc_bin }} ls lab --json"
+  register: minio_existing_buckets
+  changed_when: false
+
+- name: Create the buckets
+  command: "{{ minio_mc_bin }} mb lab/{{ item }}"
+  loop: "{{ minio_buckets }}"
+  # mc печатает по строке json на бакет, ключ выглядит как "имя-бакета/". Ищем
+  # именно с косой чертой, иначе имя бакета совпало бы с куском чужого имени.
+  when: (item ~ '/"') not in minio_existing_buckets.stdout
+
+- name: Render the application policies
+  template:
+    src: policy.json.j2
+    dest: "/etc/minio-policy-{{ item.name }}.json"
+    mode: '0644'
+  loop: "{{ minio_apps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: minio_policy_files
+
+- name: Load the application policies
+  command: >-
+    {{ minio_mc_bin }} admin policy create lab
+    {{ item.item.name }}-readwrite /etc/minio-policy-{{ item.item.name }}.json
+  loop: "{{ minio_policy_files.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: item is changed
+
+- name: Read the existing users
+  command: "{{ minio_mc_bin }} admin user list lab --json"
+  register: minio_existing_users
+  changed_when: false
+
+- name: Create the application users
+  command: "{{ minio_mc_bin }} admin user add lab {{ item.name }} {{ item.password }}"
+  loop: "{{ minio_apps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: true
+  when: ('"' ~ item.name ~ '"') not in minio_existing_users.stdout
+
+# mc admin policy attach идемпотентен на сервере, но печатает одно и то же и
+# при первом, и при повторном вызове, так что по выводу состояние не понять.
+# Поэтому спрашиваем текущую привязку и не трогаем её, если она уже есть.
+- name: Read the current policy mappings
+  command: >-
+    {{ minio_mc_bin }} admin policy entities lab
+    --policy {{ item.name }}-readwrite --json
+  loop: "{{ minio_apps }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: minio_mappings
+  changed_when: false
+
+- name: Attach the policies to the application users
+  command: >-
+    {{ minio_mc_bin }} admin policy attach lab
+    {{ item.item.name }}-readwrite --user {{ item.item.name }}
+  loop: "{{ minio_mappings.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: >-
+    item.item.name not in (item.stdout | from_json).result.policyMappings
+    | default([]) | map(attribute='users') | select | flatten | list

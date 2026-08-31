@@ -1,0 +1,30 @@
+# {{ ansible_managed }}
+#
+# Юнит повторяет официальный из документации MinIO. Осознанно не расходимся:
+# LimitNOFILE большой, потому что каждый объект это файл; TimeoutStopSec
+# бесконечный и SendSIGKILL выключен, потому что убитый на середине записи
+# сервер оставляет за собой недописанные части объектов.
+
+[Unit]
+Description=MinIO
+Documentation=https://docs.min.io
+Wants=network-online.target
+After=network-online.target
+AssertFileIsExecutable={{ minio_bin }}
+
+[Service]
+WorkingDirectory=/usr/local
+User={{ minio_service_user }}
+Group={{ minio_service_user }}
+ProtectProc=invisible
+EnvironmentFile=/etc/default/minio
+ExecStart={{ minio_bin }} server $MINIO_OPTS $MINIO_VOLUMES
+Restart=always
+LimitNOFILE=1048576
+MemoryAccounting=no
+TasksMax=infinity
+TimeoutStopSec=infinity
+SendSIGKILL=no
+
+[Install]
+WantedBy=multi-user.target

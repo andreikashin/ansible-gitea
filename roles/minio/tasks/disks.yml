@@ -1,0 +1,68 @@
+---
+- name: Install storage tooling
+  apt:
+    name:
+      - xfsprogs
+      - curl
+      - ca-certificates
+      - qemu-guest-agent
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Create the service account
+  group:
+    name: "{{ minio_service_user }}"
+    system: true
+
+- name: Create the service user
+  user:
+    name: "{{ minio_service_user }}"
+    group: "{{ minio_service_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Check that every data disk is present
+  stat:
+    path: "{{ minio_disk_by_id }}{{ item }}"
+  loop: "{{ range(1, (minio_data_disks | int) + 1) | list }}"
+  register: minio_disk_stat
+
+- name: Fail if a data disk is missing
+  assert:
+    that: item.stat.exists
+    fail_msg: >-
+      Диска {{ item.invocation.module_args.path }} в госте нет. Проверь, что
+      create_minio.yml прицепил все {{ minio_data_disks }} дисков.
+    quiet: true
+  loop: "{{ minio_disk_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+# XFS, потому что этого просит сам MinIO: он рассчитывает на её поведение при
+# большом числе мелких файлов и на быстрое расширение inode. Файловая система
+# кладётся прямо на диск, без таблицы разделов: раздел тут ничего не даёт, а
+# лишний слой при замене диска только мешает.
+- name: Create the filesystems
+  filesystem:
+    dev: "{{ minio_disk_by_id }}{{ item }}"
+    fstype: xfs
+  loop: "{{ range(1, (minio_data_disks | int) + 1) | list }}"
+
+- name: Mount the data disks
+  mount:
+    path: "{{ minio_mount_prefix }}{{ item }}"
+    src: "{{ minio_disk_by_id }}{{ item }}"
+    fstype: xfs
+    opts: defaults,noatime
+    state: mounted
+  loop: "{{ range(1, (minio_data_disks | int) + 1) | list }}"
+
+- name: Hand the mounts to the service user
+  file:
+    path: "{{ minio_mount_prefix }}{{ item }}"
+    owner: "{{ minio_service_user }}"
+    group: "{{ minio_service_user }}"
+    mode: '0750'
+  loop: "{{ range(1, (minio_data_disks | int) + 1) | list }}"

@@ -1,0 +1,43 @@
+# Шаблон для host_vars/minio_node.yml (gitignored). Скопировать, заполнить,
+# добавить хост в [minio_group] в inventory.ini.
+
+ansible_host: 192.168.1.x
+ansible_user: user
+
+node_domain: blob.example.com
+
+# Гест. VMID по конвенции лабы: 10000 плюс последний октет адреса.
+minio_vmid: 10029
+minio_pve_target: pve2
+minio_vm_name: blob
+minio_template_vmid: 904
+minio_ip: 192.168.1.x
+minio_cidr: 24
+minio_gateway: 192.168.1.1
+minio_nameserver: 192.168.1.x
+minio_cores: 4
+minio_memory: 8192
+minio_disk_grow: 12G
+minio_storage: local-lvm
+
+# Диски под данные. Каждый отдельным виртуальным диском, а не одним большим:
+# MinIO раскладывает erasure-код по дискам, и на одном диске никакого erasure
+# нет. Четыре диска дают EC:2, то есть переживание отказа двух из четырёх.
+#
+# На ноде с реальными корзинами число дисков равно числу корзин, а размер не
+# задаётся вовсе: туда диски пробрасываются, а не нарезаются из пула.
+minio_data_disks: 4
+minio_data_disk_size: 20
+
+# Учётка администратора хранилища. Приложения ей не пользуются.
+minio_root_user: minioadmin
+minio_root_password: "changeme"
+
+# Потребители. У каждого своя учётка и политика ровно на его бакеты.
+minio_apps:
+  - name: first-app
+    password: "changeme"
+    buckets: [first-bucket, backups]
+  - name: second-app
+    password: "changeme"
+    buckets: [second-bucket]
