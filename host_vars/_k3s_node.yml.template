@@ -1,0 +1,28 @@
+# Шаблон для host_vars/k3s_server1.yml, k3s_agent1.yml и так далее (gitignored).
+# Скопировать по файлу на ноду, заполнить, добавить хосты в [k3s_server_group]
+# и [k3s_agent_group] в inventory.ini.
+#
+# VMID по конвенции лабы: 10000 плюс последний октет адреса. Просто октет не
+# годится, Proxmox не принимает VMID меньше 100.
+
+ansible_host: 192.168.1.x
+ansible_user: user
+
+# Гест
+k3s_vmid: 10030
+k3s_vm_name: k3s-server1
+k3s_ip: 192.168.1.x
+k3s_cidr: 24
+k3s_gateway: 192.168.1.1
+k3s_nameserver: 192.168.1.x
+k3s_cores: 4
+k3s_memory: 8192
+# Шаблон облачного образа отдаёт 3.5 ГиБ. Растим до 32: под сам k3s хватило бы
+# меньше, но образы контейнеров лежат тут же, и место кончается именно из-за них.
+k3s_disk_grow: 28G
+k3s_storage: local-lvm
+
+# Нода Proxmox и шаблон на ней. Шаблон облачный, с cloud-init: обычный образ
+# без него не примет ни статику, ни ключ.
+k3s_pve_target: pve3
+k3s_template_vmid: 904

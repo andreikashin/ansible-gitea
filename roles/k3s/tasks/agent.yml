@@ -1,0 +1,23 @@
+---
+- name: Read the cluster token from the first server
+  slurp:
+    src: "{{ k3s_token_path }}"
+  delegate_to: "{{ k3s_first_server }}"
+  register: k3s_agent_token
+  when: k3s_needs_install
+
+- name: Install k3s as an agent
+  command: /tmp/k3s-install.sh
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: >-
+      agent {{ k3s_agent_extra_args | join(' ') }}
+    K3S_URL: "{{ k3s_server_url }}"
+    K3S_TOKEN: "{{ k3s_agent_token.content | b64decode | trim }}"
+  when: k3s_needs_install
+
+- name: Ensure the service is enabled and running
+  systemd:
+    name: k3s-agent
+    state: started
+    enabled: true

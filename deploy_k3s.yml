@@ -1,0 +1,116 @@
+---
+# Ставит k3s в гесты, созданные create_k3s.yml, и собирает из них кластер.
+#
+# Три плея, и порядок между ними обязателен. Сначала сервера, потому что токен,
+# по которому присоединяются все остальные, генерирует первый сервер при старте:
+# до этого момента его физически нет. Потом агенты. Потом проверка со стороны
+# API, что кластер видит ровно те ноды, что описаны в инвентаре.
+#
+# Сервера идут serial: 1 не ради осторожности, а по необходимости. При HA из
+# трёх серверов второй и третий присоединяются к первому, и параллельный старт
+# упирается в то, что etcd ещё не выбрал лидера.
+#
+# Версия прибита в group_vars/k3s_cluster.yml. Плейбук не обновляет уже
+# установленный k3s: апгрейд кластера это отдельная операция со своим порядком,
+# а не побочный эффект прогона.
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini create_k3s.yml   # один раз, создаёт гесты
+#   ansible-playbook -i inventory.ini deploy_k3s.yml   # кластер
+
+- name: Install the k3s servers
+  hosts: k3s_server_group
+  become: true
+  serial: 1
+
+  pre_tasks:
+    # cloud-init на свежем госте держит замок apt, и первый прогон падает на
+    # ровном месте. Ждём его, а не ретраим apt.
+    - name: Wait for cloud-init to finish
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+  roles:
+    - k3s
+
+- name: Install the k3s agents
+  hosts: k3s_agent_group
+  become: true
+
+  pre_tasks:
+    - name: Wait for cloud-init to finish
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+  roles:
+    - k3s
+
+- name: Verify the cluster and collect the kubeconfig
+  hosts: k3s_server_group[0]
+  become: true
+  gather_facts: false
+
+  tasks:
+    # Нода регистрируется в API не мгновенно после старта сервиса, поэтому
+    # ждём, а не проверяем сразу и не спим фиксированное время.
+    - name: Wait for every node to register and report Ready
+      command: k3s kubectl get nodes -o json
+      register: k3s_nodes_json
+      changed_when: false
+      until: >-
+        (k3s_nodes_json.stdout | from_json)['items']
+        | map(attribute='status.conditions') | flatten
+        | selectattr('type', 'equalto', 'Ready')
+        | selectattr('status', 'equalto', 'True')
+        | list | length == groups['k3s_cluster'] | length
+      retries: 30
+      delay: 10
+
+    - name: Check that the cluster matches the inventory
+      vars:
+        cluster_nodes: "{{ (k3s_nodes_json.stdout | from_json)['items'] | map(attribute='metadata.name') | list }}"
+        expected: "{{ groups['k3s_cluster'] | map('extract', hostvars, 'k3s_vm_name') | list }}"
+      assert:
+        that: cluster_nodes | sort == expected | sort
+        fail_msg: >-
+          Кластер собрался не из тех нод. В API: {{ cluster_nodes | sort | join(', ') }}.
+          В инвентаре: {{ expected | sort | join(', ') }}.
+        quiet: true
+
+    - name: Read the kubeconfig
+      slurp:
+        src: "{{ k3s_kubeconfig_path }}"
+      register: k3s_kubeconfig
+
+    - name: Make sure the kubeconfig directory exists on the control node
+      file:
+        path: "{{ k3s_kubeconfig_local | dirname }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+
+    # k3s пишет в kubeconfig 127.0.0.1, который снаружи ноды не значит ничего.
+    - name: Write the kubeconfig to the control node with a reachable address
+      copy:
+        content: >-
+          {{ k3s_kubeconfig.content | b64decode
+             | replace('https://127.0.0.1:' ~ k3s_api_port, k3s_server_url) }}
+        dest: "{{ k3s_kubeconfig_local }}"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+    - name: Where things are
+      vars:
+        nodes: "{{ (k3s_nodes_json.stdout | from_json)['items'] }}"
+      debug:
+        msg:
+          - "Нод в кластере: {{ nodes | length }} ({{ nodes | map(attribute='metadata.name') | join(', ') }})"
+          - "Версия:     {{ (nodes | first).status.nodeInfo.kubeletVersion }}"
+          - "Выключено:  {{ k3s_disable | join(', ') | default('ничего', true) }}"
+          - "API:        {{ k3s_server_url }}"
+          - "kubeconfig: {{ k3s_kubeconfig_local }} на управляющей машине"
+          - "Проверить:  KUBECONFIG={{ k3s_kubeconfig_local }} kubectl get nodes"

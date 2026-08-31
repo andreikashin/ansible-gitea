@@ -1,0 +1,50 @@
+---
+# Первый сервер поднимает кластер, остальные к нему присоединяются. Разница
+# только в этом, поэтому ветка одна и короткая.
+#
+# --cluster-init нужен, лишь когда серверов больше одного: он переключает k3s с
+# встроенного sqlite на встроенный etcd. Ставить его на одиночный сервер значит
+# без нужды получить etcd и его обслуживание.
+- name: Work out the server arguments
+  set_fact:
+    k3s_exec: >-
+      server
+      {% if groups['k3s_server_group'] | length > 1 %}
+      {% if inventory_hostname == k3s_first_server %}--cluster-init{% else %}--server {{ k3s_server_url }}{% endif %}
+      {% endif %}
+      {% for component in k3s_disable %}--disable {{ component }} {% endfor %}
+      --write-kubeconfig-mode {{ k3s_write_kubeconfig_mode }}
+      --tls-san {{ ansible_host }}
+      {{ k3s_server_extra_args | join(' ') }}
+
+# Токен нужен только серверам, которые присоединяются к уже живому кластеру.
+- name: Read the cluster token from the first server
+  slurp:
+    src: "{{ k3s_token_path }}"
+  delegate_to: "{{ k3s_first_server }}"
+  register: k3s_join_token
+  when:
+    - k3s_needs_install
+    - inventory_hostname != k3s_first_server
+
+- name: Install k3s as a server
+  command: /tmp/k3s-install.sh
+  environment:
+    INSTALL_K3S_VERSION: "{{ k3s_version }}"
+    INSTALL_K3S_EXEC: '{{ k3s_exec | regex_replace("\s+", " ") | trim }}'
+    K3S_TOKEN: "{{ (k3s_join_token.content | b64decode | trim) if (k3s_join_token.content is defined) else omit }}"
+  when: k3s_needs_install
+
+- name: Ensure the service is enabled and running
+  systemd:
+    name: k3s
+    state: started
+    enabled: true
+
+# Дальше по плейбуку идут агенты, и они возьмут токен отсюда. Пока API не
+# отвечает, файла токена может ещё не быть.
+- name: Wait for the API to answer
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ k3s_api_port }}"
+    timeout: 180

@@ -1,0 +1,38 @@
+---
+# Пререквизиты у k3s минимальные, но два пакета нужны всегда: curl тянет
+# инсталлятор, а без iptables-persistent и прочего можно обойтись, потому что
+# правила k3s ставит сам и держит в своей цепочке.
+- name: Install prerequisites
+  apt:
+    name:
+      - curl
+      - ca-certificates
+      - qemu-guest-agent
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Read the installed version
+  command: k3s --version
+  register: k3s_installed
+  changed_when: false
+  failed_when: false
+
+- name: Remember whether the pinned version is already in place
+  set_fact:
+    k3s_needs_install: >-
+      {{ k3s_installed.rc != 0
+         or (k3s_version | replace('+', ' ')).split()[0] not in k3s_installed.stdout }}
+
+- name: Download the install script
+  get_url:
+    url: "{{ k3s_install_script_url }}"
+    dest: /tmp/k3s-install.sh
+    mode: '0755'
+  when: k3s_needs_install
+
+- import_tasks: server.yml
+  when: k3s_node_role == 'server'
+
+- import_tasks: agent.yml
+  when: k3s_node_role == 'agent'

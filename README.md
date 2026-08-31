@@ -160,6 +160,45 @@ After a run the records the server expects in the zone (DKIM public keys
 included) are written to `/etc/stalwart/dns-records.txt` on the guest and echoed
 at the end of the play.
 
+## k3s cluster
+
+`create_k3s.yml` clones the Ubuntu cloud template into one guest per inventory
+host; `deploy_k3s.yml` installs k3s into them and joins them into a cluster.
+
+```bash
+cp host_vars/_k3s_node.yml.template host_vars/k3s_server1.yml   # one per node, gitignored
+# list the hosts in [k3s_server_group] and [k3s_agent_group] in inventory.ini
+
+ansible-playbook -i inventory.ini create_k3s.yml -e k3s_pve_target=pveX
+ansible-playbook -i inventory.ini deploy_k3s.yml
+```
+
+The shape of the cluster is not baked into the playbooks: they build exactly the
+hosts listed in the inventory. Put one host in `[k3s_server_group]` and you get a
+single server on the embedded SQLite backend. Put three and the first one is
+started with `--cluster-init`, which switches k3s to embedded etcd, and the rest
+join it. Servers run `serial: 1` because a parallel start races etcd leader
+election.
+
+There is no pre-shared cluster token to manage. The first server generates one at
+`/var/lib/rancher/k3s/server/node-token` on startup, and every later node reads it
+from there, which is also why the servers have to be installed before the agents.
+
+The template may carry a public key the control node has no pair for, so the
+playbook writes its own key onto the clone instead of trusting what is baked in.
+Templates are not shared between Proxmox nodes, and a freshly reinstalled node
+has none at all, so a missing one is built from the official Ubuntu cloud image
+the same way `deploy_vault.yml` builds a Debian one.
+
+Version is pinned in `group_vars/k3s_cluster.yml`. Re-running the playbook does
+**not** upgrade an existing installation: a cluster upgrade has its own order
+(servers first, then agents) and should not happen as a side effect.
+
+The last play verifies the result from the API rather than from systemd: it waits
+until every node reports `Ready` and asserts that the set of node names matches
+the inventory. It then writes a kubeconfig to the control node with the server
+address rewritten, since k3s puts `127.0.0.1` in the file.
+
 ## Backups
 
 `backup_proxmox_vms.yml` backs up Proxmox guests (both QEMU VMs and LXC CTs) via
