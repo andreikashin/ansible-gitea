@@ -1,0 +1,28 @@
+# {{ ansible_managed }}
+#
+# Юнит повторяет то, что пишет официальный install.sh. Осознанно не расходимся
+# с апстримом: CAP_NET_BIND_SERVICE вместо запуска от root, SIGINT на остановку
+# (сервер по нему корректно дописывает очередь), Conflicts с postfix и exim,
+# чтобы 25-й порт не разъехался между двумя демонами.
+
+[Unit]
+Description=Stalwart
+Conflicts=postfix.service sendmail.service exim4.service
+After=network-online.target
+
+[Service]
+Type=simple
+LimitNOFILE=65536
+KillMode=process
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=-{{ mail_conf_dir }}/stalwart.env
+ExecStart={{ mail_bin }} --config={{ mail_conf_dir }}/config.json
+SyslogIdentifier=stalwart
+User={{ mail_service_user }}
+Group={{ mail_service_user }}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

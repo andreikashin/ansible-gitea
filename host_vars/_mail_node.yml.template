@@ -1,0 +1,35 @@
+ansible_host: 192.168.1.x
+ansible_user: user
+
+node_domain: mail.example.com
+
+# Гест. VMID по конвенции лабы: 10000 плюс последний октет адреса.
+mail_vmid: 10025
+mail_pve_target: pve1
+mail_vm_name: mail
+mail_template_vmid: 900
+mail_ip: 192.168.1.x
+mail_cidr: 24
+mail_gateway: 192.168.1.1
+mail_nameserver: 192.168.1.x
+mail_cores: 2
+mail_memory: 4096
+# Шаблон отдаёт 16 ГиБ, растим до 50 ГиБ. Это же и квота: thin-пул на ноде
+# напряжён, безлимитный рост вложений повесил бы все гесты разом.
+mail_disk_grow: 34G
+mail_storage: local-lvm
+
+# Почтовые домены и адреса.
+mail_hostname: mail.example.com
+mail_domain: example.com
+
+# Учётка администратора Stalwart. Файл в .gitignore, наружу не уезжает.
+mail_admin_password: "changeme"
+
+# Пароль ящика. Тот же файл, та же оговорка.
+mail_account_password: "changeme"
+
+# Токен Cloudflare с правами Zone:DNS:Edit на зону домена. Нужен для ACME
+# по DNS-01. Пока пустой, Stalwart живёт на самоподписанном сертификате и
+# наружу его показывать нельзя.
+mail_acme_cf_token: ""

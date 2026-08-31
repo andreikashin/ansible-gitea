@@ -1,0 +1,137 @@
+---
+# Создание геста под почтовый сервер клонированием Debian-шаблона на pve1.
+#
+# Почему отдельным плейбуком от deploy_mail.yml: создание геста это разовая
+# операция на ноде Proxmox, а установка Stalwart идёт уже внутрь геста по SSH.
+# Разные hosts, в один play не сходятся. Тот же порядок, что у observability.
+#
+# Размещение на pve1 определено в §9.1 плана: почтовик это инфра-pet, always-on,
+# вне K3s, тот же класс сервиса, что Vault. Ноды с базами отпадают по правилу
+# слоя: интернет-facing сервис не ставится на хост с data-tier.
+#
+# Диск это квота, а не «сколько не жалко». Thin-пул на ноде общий, его
+# переполнение вешает все гесты разом, поэтому рост вложений упирается в
+# фиксированный том, а не в остаток пула.
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini create_mail.yml
+#   ansible-playbook -i inventory.ini create_mail.yml --check --diff
+
+- name: Provision the mail guest on Proxmox
+  hosts: "{{ mail_pve_target | default('pve1') }}"
+  become: true
+  gather_facts: false
+  vars:
+    mail_vars: "{{ hostvars[groups['mail_group'] | first] }}"
+    mail_vmid: "{{ mail_vars.mail_vmid }}"
+    mail_template_vmid: "{{ mail_vars.mail_template_vmid }}"
+    mail_vm_name: "{{ mail_vars.mail_vm_name }}"
+    mail_ip: "{{ mail_vars.mail_ip }}"
+    mail_cidr: "{{ mail_vars.mail_cidr }}"
+    mail_gateway: "{{ mail_vars.mail_gateway }}"
+    mail_nameserver: "{{ mail_vars.mail_nameserver }}"
+    mail_cores: "{{ mail_vars.mail_cores }}"
+    mail_memory: "{{ mail_vars.mail_memory }}"
+    mail_disk_grow: "{{ mail_vars.mail_disk_grow }}"
+    mail_storage: "{{ mail_vars.mail_storage }}"
+
+  tasks:
+    - name: Validate the source template exists and is a template
+      command: "qm config {{ mail_template_vmid }}"
+      register: mail_tmpl
+      changed_when: false
+
+    - name: Fail if the source is not a template
+      assert:
+        that: "'template: 1' in mail_tmpl.stdout"
+        fail_msg: >-
+          VMID {{ mail_template_vmid }} на {{ inventory_hostname }} не является шаблоном.
+          Клонировать живой гест этим плейбуком нельзя.
+        quiet: true
+
+    # Занятый VMID не перезаписываем никогда: на другом конце может оказаться
+    # работающий сервис.
+    - name: Check whether the target VMID is already taken
+      command: "qm config {{ mail_vmid }}"
+      register: mail_existing
+      changed_when: false
+      failed_when: false
+
+    # Адрес .25 выбран по мнемонике SMTP-порта, VMID по конвенции pve1
+    # = 10000 плюс октет. Занятость октета проверяем до клона, а не после:
+    # поднять второй хост с чужим адресом дешевле не заметить, чем откатить.
+    - name: Check that the target address is not answering already
+      command: "ping -c 2 -W 1 {{ mail_ip }}"
+      register: mail_ping
+      changed_when: false
+      failed_when: false
+      when: mail_existing.rc != 0
+
+    - name: Fail if the address is taken by something else
+      assert:
+        that: mail_ping.rc != 0
+        fail_msg: >-
+          {{ mail_ip }} отвечает на ping, а геста {{ mail_vmid }} ещё нет.
+          Октет занят кем-то другим, выбери свободный.
+        quiet: true
+      when: mail_existing.rc != 0
+
+    - name: Clone the template
+      command:
+        argv:
+          - qm
+          - clone
+          - "{{ mail_template_vmid }}"
+          - "{{ mail_vmid }}"
+          - --name
+          - "{{ mail_vm_name }}"
+          - --full
+          - "1"
+          - --storage
+          - "{{ mail_storage }}"
+      when: mail_existing.rc != 0
+
+    - name: Apply resources and static addressing
+      command:
+        argv:
+          - qm
+          - set
+          - "{{ mail_vmid }}"
+          - --cores
+          - "{{ mail_cores }}"
+          - --memory
+          - "{{ mail_memory }}"
+          - --onboot
+          - "1"
+          - --ipconfig0
+          - "ip={{ mail_ip }}/{{ mail_cidr }},gw={{ mail_gateway }}"
+          - --nameserver
+          - "{{ mail_nameserver }}"
+      when: mail_existing.rc != 0
+
+    # Шаблону хватает своего диска, почте нужен запас под ящики и очередь.
+    # Запас ограниченный: см. комментарий про thin-пул в шапке.
+    - name: Grow the root disk
+      command: "qm resize {{ mail_vmid }} scsi0 +{{ mail_disk_grow }}"
+      when: mail_existing.rc != 0
+
+    - name: Start the guest
+      command: "qm start {{ mail_vmid }}"
+      register: mail_start
+      changed_when: "'already running' not in mail_start.stderr"
+      failed_when: mail_start.rc != 0 and 'already running' not in mail_start.stderr
+
+    - name: Wait for SSH on the new guest
+      wait_for:
+        host: "{{ mail_ip }}"
+        port: 22
+        timeout: 300
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      debug:
+        msg:
+          - "Гест {{ mail_vm_name }} ({{ mail_vmid }}) на {{ inventory_hostname }}, адрес {{ mail_ip }}."
+          - "{{ 'Создан.' if mail_existing.rc != 0 else 'Уже существовал, параметры не трогали.' }}"
+          - "Дальше: ansible-playbook -i inventory.ini deploy_mail.yml"

@@ -118,6 +118,48 @@ touching anything, but keep a console cable for the switch and MAC-winbox for
 the router within reach. The router role owns the `filter` and `nat` tables
 completely: rules absent from the templates are deleted.
 
+## Mail server
+
+`create_mail.yml` clones the Debian template into a dedicated guest;
+`deploy_mail.yml` installs [Stalwart](https://github.com/stalwartlabs/stalwart)
+into it and configures the server.
+
+```bash
+cp host_vars/_mail_node.yml.template host_vars/mail_node.yml   # fill in, gitignored
+# add the host to [mail_group] in inventory.ini
+
+ansible-playbook -i inventory.ini create_mail.yml
+ansible-playbook -i inventory.ini deploy_mail.yml
+```
+
+Stalwart 0.16 has almost no file configuration. `config.json` holds only the
+choice of storage backend; domains, DKIM keys, accounts and listeners live in a
+registry inside that store and are edited over JMAP. So the role installs the
+binary and the unit as files, then talks to the running server through the API.
+
+Until `config.json` exists the server comes up in **bootstrap mode** on port
+8080 with a single writable object, `x:Bootstrap`. One `set` on it creates the
+store, the domain, the DKIM keys and the admin account, after which the server
+switches to normal mode. `STALWART_RECOVERY_ADMIN` in `stalwart.env` is what
+makes this scriptable: it pins an admin credential that works before any
+directory exists, so the playbook never has to scrape a generated password out
+of the logs.
+
+The binary is installed natively rather than in a container, unlike the rest of
+the lab. The mail server is the only service exposed to the internet, so it does
+without an extra root daemon underneath it; and ports 25/465/587/993 plus the
+real remote IP of the sender come for free, which matters because the remote IP
+is half of every antispam and DNSBL decision.
+
+What the playbook deliberately does **not** do: touch DNS, request a
+certificate, or configure a smarthost for outbound mail. Those are gated on
+things outside Ansible: the MX cutover, a reachable port 443 or a DNS provider
+token, and a relay contract. Inbound mail does not depend on any of them.
+
+After a run the records the server expects in the zone (DKIM public keys
+included) are written to `/etc/stalwart/dns-records.txt` on the guest and echoed
+at the end of the play.
+
 ## Backups
 
 `backup_proxmox_vms.yml` backs up Proxmox guests (both QEMU VMs and LXC CTs) via

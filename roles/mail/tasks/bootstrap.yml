@@ -1,0 +1,71 @@
+---
+# Первичная инициализация. В 0.16 у Stalwart почти нет файлового конфига:
+# config.json хранит только выбор хранилища, всё остальное живёт в реестре
+# внутри самого хранилища и правится через JMAP. Пока config.json нет, сервер
+# поднимается в bootstrap-режиме и слушает единственный порт 8080, на котором
+# доступен ровно один объект, x:Bootstrap. Один set по нему создаёт хранилище,
+# домен, DKIM-ключи и учётку администратора, после чего сервер переходит в
+# нормальный режим.
+
+- name: Check whether the server has been initialized
+  stat:
+    path: "{{ mail_conf_dir }}/config.json"
+  register: mail_config
+
+- name: Initialize the server
+  when: not mail_config.stat.exists
+  block:
+    - name: Wait for the bootstrap listener
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ mail_http_port }}"
+        timeout: 120
+
+    - name: Set up storage, domain, DKIM and the admin account
+      uri:
+        url: "http://127.0.0.1:{{ mail_http_port }}/jmap/"
+        method: POST
+        url_username: "{{ mail_admin_user }}"
+        url_password: "{{ mail_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          using: ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"]
+          methodCalls:
+            - - "x:Bootstrap/set"
+              - update:
+                  singleton:
+                    serverHostname: "{{ mail_hostname }}"
+                    defaultDomain: "{{ mail_domain }}"
+                    generateDkimKeys: true
+                    requestTlsCertificate: "{{ mail_request_tls_certificate }}"
+                    dnsServer: {"@type": "{{ mail_dns_management }}"}
+                    directory: {"@type": "Internal"}
+                    dataStore: {"@type": "RocksDb", "path": "{{ mail_data_dir }}/"}
+                    blobStore: {"@type": "Default"}
+                    searchStore: {"@type": "Default"}
+                    inMemoryStore: {"@type": "Default"}
+              - "c0"
+      register: mail_bootstrap
+
+    - name: Fail if the bootstrap was rejected
+      assert:
+        that:
+          - mail_bootstrap.json.methodResponses[0][1].updated is defined
+          - mail_bootstrap.json.methodResponses[0][1].updated.singleton is defined
+        fail_msg: >-
+          Инициализация не прошла: {{ mail_bootstrap.json.methodResponses[0][1] | to_json }}
+        quiet: true
+
+    # Реестр записан, но слушатели читаются на старте: без рестарта сервер
+    # так и останется на одном 8080.
+    - name: Restart into normal mode
+      systemd:
+        name: stalwart
+        state: restarted
+
+    - name: Wait for the management listener
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ mail_https_port }}"
+        timeout: 120

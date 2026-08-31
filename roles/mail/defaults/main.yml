@@ -1,0 +1,63 @@
+---
+# Версия прибита гвоздями. Почтовик это единственный сервис в лабе, который
+# слушает интернет, и «latest» тут значит «выкатилось само и молча»: апгрейд
+# должен быть коммитом, а не побочным эффектом прогона плейбука.
+mail_version: "0.16.19"
+mail_arch: x86_64-unknown-linux-gnu
+
+# Раскладка FHS, ровно как её делает официальный install.sh. Не переносим
+# ничего в /opt: чем меньше отличий от апстрима, тем понятнее чужие баг-репорты.
+mail_bin: /usr/local/bin/stalwart
+mail_conf_dir: /etc/stalwart
+mail_data_dir: /var/lib/stalwart
+mail_log_dir: /var/log/stalwart
+mail_service_user: stalwart
+
+# Ставим бинарь, а не контейнер, хотя остальной лаб живёт в compose. Три
+# причины: на самой открытой машине не нужен ещё один слой с root-демоном;
+# Stalwart это один статический бинарь, контейнер вокруг него не даёт ничего;
+# порты 25/465/587/993 и реальный remote IP отправителя достаются без возни с
+# NAT, а remote IP для антиспама и DNSBL это половина решения о письме.
+
+# Порты. Наружу по плану §9.1 уходят только 25/465/587/993, всё остальное
+# слушается для LAN и закрывается на периметре.
+mail_smtp_port: 25
+mail_submissions_port: 465
+mail_submission_port: 587
+mail_imaps_port: 993
+mail_https_port: 443
+mail_http_port: 8080
+
+# Учётка администратора. Живёт двумя способами сразу: как принципал
+# admin@<домен> в директории и как STALWART_RECOVERY_ADMIN в env-файле.
+# Второе это break-glass: оно работает и в bootstrap-режиме, когда никакой
+# директории ещё нет, и именно им ходит ansible.
+mail_admin_user: admin
+
+# Ящик и алиасы. Адреса role-based, не привязанные к личным именам: это
+# предусловие exit-плана §9.5, переезд на Migadu не должен упираться в то,
+# что почта завязана на конкретного человека.
+mail_account: info
+mail_aliases:
+  - sales
+  - billing
+  - postmaster
+  - abuse
+  - dmarc
+
+# ACME пока выключен. TLS-ALPN-01 требует, чтобы 443 отвечал из интернета, а
+# периметр ещё не открыт; DNS-01 требует токен Cloudflare. До тех пор Stalwart
+# живёт на самоподписанном, и наружу его показывать нельзя.
+mail_request_tls_certificate: false
+
+# Управление DNS оставляем ручным. У Stalwart есть провайдер Cloudflare, и он
+# умеет сам публиковать DKIM/SPF/DMARC/MTA-STS, но сейчас зоной владеет
+# Cloudflare Email Routing, и автопубликация подралась бы с существующими
+# записями. Переключение MX по плану §9.3 делается руками и осознанно.
+mail_dns_management: Manual
+
+# Заголовок using для всех вызовов JMAP. Реестр настроек лежит за
+# urn:stalwart:jmap, без него сервер отвечает unknownCapability.
+mail_jmap_using:
+  - "urn:ietf:params:jmap:core"
+  - "urn:stalwart:jmap"

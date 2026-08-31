@@ -1,0 +1,184 @@
+---
+# Дальше всё идёт через JMAP на порт 443: в 0.16 реестр настроек лежит внутри
+# хранилища, а не в файлах, и правится только через API. Сертификат
+# самоподписанный, validate_certs выключен осознанно: это петля на 127.0.0.1,
+# проверять там нечего.
+
+- name: Wait for the management listener
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ mail_https_port }}"
+    timeout: 120
+
+- name: Configure the server over JMAP
+  module_defaults:
+    uri:
+      url: "https://127.0.0.1:{{ mail_https_port }}/jmap/"
+      method: POST
+      url_username: "{{ mail_admin_user }}"
+      url_password: "{{ mail_admin_password }}"
+      force_basic_auth: true
+      validate_certs: false
+      body_format: json
+  block:
+    - name: Read the domain
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls: [["x:Domain/get", {"ids": null}, "c0"]]
+      register: mail_domains
+
+    - name: Remember the domain
+      set_fact:
+        mail_domain_object: >-
+          {{ mail_domains.json.methodResponses[0][1].list
+             | selectattr('name', 'equalto', mail_domain) | list }}
+
+    - name: Fail if the domain is missing
+      assert:
+        that: mail_domain_object | length == 1
+        fail_msg: "Домена {{ mail_domain }} нет в реестре, инициализация прошла не до конца."
+        quiet: true
+
+    - name: Remember the domain id
+      set_fact:
+        mail_domain_id: "{{ (mail_domain_object | first).id }}"
+
+    # Списки объектов в реестре передаются картой с индексами в ключах, а не
+    # массивом: массив сервер отвергает как invalidPatch.
+    - name: Build the alias map
+      set_fact:
+        mail_alias_map: >-
+          {{ mail_alias_map | default({})
+             | combine({ (idx | string): {'name': item, 'domainId': mail_domain_id} }) }}
+      loop: "{{ mail_aliases }}"
+      loop_control:
+        index_var: idx
+
+    - name: Read the accounts
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls: [["x:Account/get", {"ids": null}, "c0"]]
+      register: mail_accounts
+
+    - name: Create the mailbox and its aliases
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls:
+            - - "x:Account/set"
+              - create:
+                  mailbox:
+                    "@type": User
+                    name: "{{ mail_account }}"
+                    domainId: "{{ mail_domain_id }}"
+                    description: Корпоративный ящик
+                    roles: {"@type": "User"}
+                    credentials:
+                      "0": {"@type": "Password", "secret": "{{ mail_account_password }}"}
+                    aliases: "{{ mail_alias_map }}"
+              - "c0"
+      register: mail_account_created
+      when: >-
+        mail_accounts.json.methodResponses[0][1].list
+        | selectattr('name', 'equalto', mail_account) | list | length == 0
+
+    - name: Fail if the mailbox was rejected
+      assert:
+        that: mail_account_created.json.methodResponses[0][1].created is defined
+        fail_msg: "Ящик не создан: {{ mail_account_created.json.methodResponses[0][1] | to_json }}"
+        quiet: true
+      when: mail_account_created is not skipped
+
+    # Инициализация заводит admin@домен со случайным паролем и показывает его
+    # ровно один раз, в ответе на bootstrap. Плейбук его не хранит, поэтому
+    # сразу переводим учётку на управляемый пароль, тот же, что в env-файле.
+    # Один известный секрет на администратора вместо двух, из которых один
+    # никому не известен.
+    - name: Align the admin password with the managed one
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls:
+            - - "x:Account/set"
+              - update:
+                  "{{ mail_admin_id }}":
+                    credentials:
+                      "0": {"@type": "Password", "secret": "{{ mail_admin_password }}"}
+              - "c0"
+      vars:
+        mail_admin_id: >-
+          {{ mail_accounts.json.methodResponses[0][1].list
+             | selectattr('name', 'equalto', mail_admin_user)
+             | map(attribute='id') | first | default('', true) }}
+      when:
+        - not mail_config.stat.exists
+        - mail_admin_id | length > 0
+
+    # Дефолты поднимают 25/465/993/995/4190 и HTTP, но submission на 587 среди
+    # них нет. По плану §9.1 наружу уходит именно 25/465/587/993, поэтому 587
+    # заводим явно: STARTTLS, не implicit TLS.
+    - name: Read the listeners
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls: [["x:NetworkListener/get", {"ids": null}, "c0"]]
+      register: mail_listeners
+
+    - name: Add the submission listener
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls:
+            - - "x:NetworkListener/set"
+              - create:
+                  submission:
+                    name: submission
+                    protocol: smtp
+                    bind: "{{ {'[::]:' ~ mail_submission_port: true} }}"
+                    useTls: true
+                    tlsImplicit: false
+              - "c0"
+      register: mail_listener_created
+      when: >-
+        mail_listeners.json.methodResponses[0][1].list
+        | selectattr('name', 'equalto', 'submission') | list | length == 0
+
+    # Слушатели читаются на старте, новый порт без рестарта не откроется.
+    - name: Restart to bind the new listener
+      systemd:
+        name: stalwart
+        state: restarted
+      when: mail_listener_created is not skipped
+
+    - name: Wait for the mail ports
+      wait_for:
+        host: 127.0.0.1
+        port: "{{ item }}"
+        timeout: 120
+      loop:
+        - "{{ mail_smtp_port }}"
+        - "{{ mail_submission_port }}"
+        - "{{ mail_submissions_port }}"
+        - "{{ mail_imaps_port }}"
+
+    # Записи, которые сервер ждёт в зоне. DKIM-ключи он сгенерировал сам, и
+    # публичную часть неоткуда взять кроме как отсюда. Кладём файлом, чтобы шаг
+    # с DNS (§9.3) не требовал лазить в веб-админку.
+    - name: Read the DNS records the server expects
+      uri:
+        body:
+          using: "{{ mail_jmap_using }}"
+          methodCalls: [["x:Domain/get", {"ids": null}, "c0"]]
+      register: mail_zone
+
+    - name: Save the zone file for the DNS step
+      copy:
+        content: >-
+          {{ (mail_zone.json.methodResponses[0][1].list
+              | selectattr('name', 'equalto', mail_domain) | first).dnsZoneFile }}
+        dest: "{{ mail_conf_dir }}/dns-records.txt"
+        owner: root
+        group: "{{ mail_service_user }}"
+        mode: '0640'

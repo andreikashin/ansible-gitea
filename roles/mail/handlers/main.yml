@@ -1,0 +1,6 @@
+---
+- name: Restart Stalwart
+  systemd:
+    name: stalwart
+    state: restarted
+    daemon_reload: true

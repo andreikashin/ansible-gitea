@@ -1,0 +1,91 @@
+---
+- name: Create the service account
+  group:
+    name: "{{ mail_service_user }}"
+    system: true
+
+- name: Create the service user
+  user:
+    name: "{{ mail_service_user }}"
+    group: "{{ mail_service_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Create the directory layout
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ mail_service_user }}"
+    group: "{{ mail_service_user }}"
+    mode: '0750'
+  loop:
+    - "{{ mail_conf_dir }}"
+    - "{{ mail_data_dir }}"
+    - "{{ mail_log_dir }}"
+
+- name: Read the installed version
+  command: "{{ mail_bin }} --version"
+  register: mail_installed
+  changed_when: false
+  failed_when: false
+
+- name: Install the pinned release
+  when: mail_installed.rc != 0 or mail_installed.stdout | trim != mail_version
+  block:
+    - name: Download the release tarball
+      get_url:
+        url: >-
+          https://github.com/stalwartlabs/stalwart/releases/download/v{{ mail_version
+          }}/stalwart-{{ mail_arch }}.tar.gz
+        dest: /tmp/stalwart-{{ mail_version }}.tar.gz
+        mode: '0644'
+
+    - name: Unpack the binary
+      unarchive:
+        src: /tmp/stalwart-{{ mail_version }}.tar.gz
+        dest: /tmp
+        remote_src: true
+
+    - name: Put the binary in place
+      copy:
+        src: /tmp/stalwart
+        dest: "{{ mail_bin }}"
+        mode: '0755'
+        remote_src: true
+      notify: Restart Stalwart
+
+# Без этого сервер не сядет на 25-й порт, потому что работает не от root.
+- name: Allow the binary to bind privileged ports
+  capabilities:
+    path: "{{ mail_bin }}"
+    # Именно "=ep", а не "=+ep": модуль сравнивает строку с выводом getcap,
+    # который нормализует форму, и на "+ep" задача каждый раз рапортует changed.
+    capability: cap_net_bind_service=ep
+    state: present
+
+- name: Install the env file
+  template:
+    src: stalwart.env.j2
+    dest: "{{ mail_conf_dir }}/stalwart.env"
+    owner: root
+    group: "{{ mail_service_user }}"
+    mode: '0640'
+  notify: Restart Stalwart
+
+- name: Install the systemd unit
+  template:
+    src: stalwart.service.j2
+    dest: /etc/systemd/system/stalwart.service
+    mode: '0644'
+  notify: Restart Stalwart
+
+- name: Ensure the service is enabled and running
+  systemd:
+    name: stalwart
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Apply pending restarts before touching the API
+  meta: flush_handlers

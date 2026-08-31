@@ -1,0 +1,86 @@
+---
+# Ставит и настраивает Stalwart в гест, созданный create_mail.yml.
+#
+# Что здесь важно понимать про 0.16: файлового конфига практически нет.
+# config.json хранит только выбор хранилища. Все настройки (домены, ключи DKIM,
+# учётки, слушатели) лежат в реестре внутри самого хранилища и правятся
+# через JMAP. Поэтому плейбук ставит бинарь и юнит файлами, а дальше говорит с
+# сервером по API. Пока config.json нет, сервер поднимается в bootstrap-режиме
+# на одном порту 8080, и первый же вызов x:Bootstrap/set создаёт всё разом.
+#
+# Чего плейбук НЕ делает и не должен:
+#   - не трогает DNS. Зоной сейчас владеет Cloudflare Email Routing,
+#     переключение MX по §9.3 делается руками и после гейта §9.2.
+#   - не выпускает сертификат. ACME по TLS-ALPN-01 требует открытого снаружи
+#     443, по DNS-01 нужен токен Cloudflare. До тех пор самоподписанный, и наружу
+#     сервер показывать нельзя.
+#   - не настраивает smarthost. Исходящая почта из домашнего диапазона упирается
+#     не в порт, а в репутацию диапазона (§9.2), и релей это отдельное решение с
+#     отдельным договором.
+#
+# Приём при этом от всего перечисленного не зависит: как только будет проброшен
+# 25-й и переставлена MX-запись, письма пойдут.
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini create_mail.yml   # один раз, создаёт гест
+#   ansible-playbook -i inventory.ini deploy_mail.yml   # сервер и настройки
+
+- name: Deploy the mail server
+  hosts: mail_group
+  become: true
+
+  pre_tasks:
+    # cloud-init на свежем госте ещё держит замок apt, и первый прогон падает
+    # на ровном месте. Ждём его, а не ретраим apt.
+    - name: Wait for cloud-init to finish
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      apt:
+        name:
+          - qemu-guest-agent
+          - ca-certificates
+          - curl
+          - libcap2-bin
+        state: present
+
+  roles:
+    - mail
+
+  post_tasks:
+    # Проверяем тракт, а не факт запуска процесса: письмо через 25-й порт и
+    # чтение его же по IMAP. Тестовое письмо скрипт за собой удаляет.
+    - name: Send a message through the server and read it back
+      script: >-
+        roles/mail/files/smoke_test.py
+        {{ mail_account }}@{{ mail_domain }} {{ mail_account_password }}
+        {{ mail_smtp_port }} {{ mail_imaps_port }}
+      args:
+        executable: python3
+      register: mail_smoke
+      changed_when: false
+
+    - name: Read back the records the server expects in DNS
+      slurp:
+        src: "{{ mail_conf_dir }}/dns-records.txt"
+      register: mail_dns
+
+    - name: Where things are
+      debug:
+        msg:
+          - "Ящик:       {{ mail_account }}@{{ mail_domain }}, алиасы: {{ mail_aliases | join('@' ~ mail_domain ~ ', ') }}@{{ mail_domain }}"
+          - "Проверка:   письмо доставлено в {{ (mail_smoke.stdout_lines | last | from_json).folder }}"
+          - "Веб-админка: https://{{ ansible_host }}/ (учётка {{ mail_admin_user }}, сертификат самоподписанный)"
+          - "Порты:      {{ mail_smtp_port }} smtp, {{ mail_submission_port }} submission, {{ mail_submissions_port }} submissions, {{ mail_imaps_port }} imaps"
+          - "Записи DNS: {{ mail_conf_dir }}/dns-records.txt на госте, публиковать по §9.3 после гейта §9.2"
+
+    - name: DNS records to publish
+      debug:
+        msg: "{{ (mail_dns.content | b64decode).split('\n') }}"
