@@ -18,6 +18,7 @@ services:
       - GITEA__server__DOMAIN={{ node_domain }}
       - GITEA__server__PROTOCOL=http
       - GITEA__server__HTTP_PORT={{ gitea_container_http_port }}
+      - GITEA__repository__DEFAULT_BRANCH=master
 
     ports:
       # Expose HTTP for reverse proxy
