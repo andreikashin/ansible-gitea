@@ -1,0 +1,47 @@
+---
+- name: Read the existing backup jobs
+  command: pvesh get /cluster/backup --output-format json
+  register: pve_backup_existing
+  changed_when: false
+
+# Идентификатор задания генерируется самим Proxmox и в API не задаётся,
+# поэтому ключом идемпотентности служит comment. Он же человекочитаемое имя в
+# веб-интерфейсе.
+- name: Create the missing jobs
+  command: >-
+    pvesh create /cluster/backup
+    --vmid "{{ item.vmid }}"
+    --storage {{ pve_backup_storage }}
+    --schedule "{{ item.schedule }}"
+    --mode {{ pve_backup_mode }}
+    --enabled 1
+    --comment "{{ item.comment }}"
+    --notes-template "{% raw %}{{guestname}}{% endraw %}"
+  loop: "{{ pve_backup_jobs }}"
+  loop_control:
+    label: "{{ item.comment }} → {{ item.vmid }} @ {{ item.schedule }}"
+  when: >-
+    item.comment not in
+    (pve_backup_existing.stdout | from_json | map(attribute='comment') | list)
+
+- name: Read them back
+  command: pvesh get /cluster/backup --output-format json
+  register: pve_backup_final
+  changed_when: false
+
+- name: Verify every wanted job is present
+  assert:
+    that: >-
+      pve_backup_jobs | map(attribute='comment') | list
+      | difference(pve_backup_final.stdout | from_json | map(attribute='comment') | list)
+      | length == 0
+    fail_msg: >-
+      На {{ inventory_hostname }} завелись не все задания. Есть:
+      {{ pve_backup_final.stdout | from_json | map(attribute='comment') | list | join(', ') }}
+    quiet: true
+
+- name: Report the schedule
+  debug:
+    msg: >-
+      {{ inventory_hostname }}:
+      {{ pve_backup_jobs | map(attribute='comment') | list | join(', ') | default('заданий нет', true) }}

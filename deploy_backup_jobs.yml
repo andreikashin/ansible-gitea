@@ -1,0 +1,20 @@
+---
+# Ночные задания vzdump на нодах Proxmox.
+#
+# Список гестов сокращён сознательно (§11.3 плана): бэкапится только то, чего
+# нет ни в git, ни в плейбуке. Harbor, traefik, jenkins, observability и агент
+# сборки восстанавливаются прогоном ролей, а не из архива, поэтому места в
+# расписании не занимают.
+#
+# Ноды standalone, общего /etc/pve между ними нет, поэтому расписание живёт на
+# каждой отдельно, и на каждой оно своё.
+#
+#   ansible-playbook -i inventory.ini deploy_backup_jobs.yml
+#   ansible-playbook -i inventory.ini deploy_backup_jobs.yml --limit pve7
+
+- name: Schedule the nightly backups
+  hosts: pve_all
+  become: true
+  gather_facts: false
+  roles:
+    - pve_backup_jobs
