@@ -1,0 +1,7 @@
+
+# Managed by Ansible, role pbs. Local edits are overwritten.
+Types: deb
+URIs: {{ pbs_repo_uri }}
+Suites: {{ ansible_distribution_release }}
+Components: {{ pbs_repo_component }}
+Signed-By: {{ pbs_keyring }}

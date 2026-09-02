@@ -1,0 +1,16 @@
+---
+# Создаёт одно пространство имён. Идемпотентность через failed_when: клиент
+# возвращает ошибку на уже существующем, и это нормальный повторный прогон, а
+# не поломка.
+
+- name: "Create namespace {{ pbs_ns }}"
+  command: "{{ pbs_bin_client }} namespace create {{ pbs_ns }}"
+  environment:
+    PBS_REPOSITORY: "{{ pbs_admin_user }}!{{ pbs_admin_token }}@localhost:{{ pbs_datastore_name }}"
+    PBS_PASSWORD: "{{ pbs_admin_blob.content | b64decode | trim }}"
+    PBS_FINGERPRINT: "{{ pbs_fingerprint }}"
+  register: pbs_ns_result
+  changed_when: pbs_ns_result.rc == 0
+  failed_when:
+    - pbs_ns_result.rc != 0
+    - "'already exists' not in (pbs_ns_result.stderr | default(''))"

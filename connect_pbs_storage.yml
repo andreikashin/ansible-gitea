@@ -1,0 +1,82 @@
+---
+# Подключает датастор PBS к каждой ноде Proxmox.
+#
+# Ноды standalone, общего /etc/pve между ними нет, поэтому хранилище
+# прописывается на каждой отдельно.
+#
+# Каждая нода пишет в СВОЁ пространство имён. Причина в том, что VMID уникальны
+# только внутри ноды: 130, 131, 132 и 200 существуют на двух машинах, 900 и 904
+# тоже, и это разные гесты. PBS группирует снимки по vm/<VMID>, так что без
+# разделения два разных геста сложились бы в одну группу, а retention начал бы
+# вперемешку выкидывать чужие снимки.
+#
+#   ansible-playbook -i inventory.ini connect_pbs_storage.yml
+#   ansible-playbook -i inventory.ini connect_pbs_storage.yml --limit pve7
+
+- name: Attach the PBS datastore to every node
+  hosts: pve_all
+  become: true
+  gather_facts: false
+
+  vars:
+    pbs_host: "{{ groups['pbs_group'] | first }}"
+    pbs_server: "{{ hostvars[pbs_host].ansible_host }}"
+    pbs_datastore_name: "{{ hostvars[pbs_host].pbs_datastore_name | default('backup') }}"
+    pbs_storage_id: "{{ hostvars[pbs_host].pbs_storage_id | default('pbs') }}"
+    pbs_backup_user: "{{ hostvars[pbs_host].pbs_backup_user | default('pve@pbs') }}"
+    pbs_backup_token: "{{ hostvars[pbs_host].pbs_backup_token | default('backup') }}"
+
+  tasks:
+    - name: Read the token secret from the backup server
+      slurp:
+        src: "{{ hostvars[pbs_host].pbs_backup_secret_file | default('/root/pbs-token.secret') }}"
+      delegate_to: "{{ pbs_host }}"
+      register: pbs_secret_blob
+      run_once: true
+      no_log: true
+
+    - name: Read the certificate fingerprint from the backup server
+      slurp:
+        src: "{{ hostvars[pbs_host].pbs_fingerprint_file | default('/root/pbs-fingerprint.txt') }}"
+      delegate_to: "{{ pbs_host }}"
+      register: pbs_fp_blob
+      run_once: true
+
+    - name: Check whether the storage is already defined
+      command: "pvesm status --storage {{ pbs_storage_id }}"
+      register: pbs_storage_present
+      changed_when: false
+      failed_when: false
+
+    # Пароль приходится передавать аргументом: pvesm при создании проверяет
+    # соединение и файл с паролем на этом этапе ещё не читает.
+    - name: Add the storage
+      command: >-
+        pvesm add pbs {{ pbs_storage_id }}
+        --server {{ pbs_server }}
+        --datastore {{ pbs_datastore_name }}
+        --username "{{ pbs_backup_user }}!{{ pbs_backup_token }}"
+        --password "{{ pbs_secret_blob.content | b64decode | trim }}"
+        --fingerprint {{ pbs_fp_blob.content | b64decode | trim }}
+      when: pbs_storage_present.rc != 0
+      no_log: true
+
+    - name: Point this node at its own namespace
+      command: "pvesm set {{ pbs_storage_id }} --namespace {{ inventory_hostname }}"
+      changed_when: true
+
+    - name: Verify the storage is reachable
+      command: "pvesm status --storage {{ pbs_storage_id }}"
+      register: pbs_storage_check
+      changed_when: false
+
+    - name: Fail when the storage is not active
+      assert:
+        that: "'active' in pbs_storage_check.stdout"
+        fail_msg: >-
+          Хранилище {{ pbs_storage_id }} на {{ inventory_hostname }} прописано,
+          но неактивно. Чаще всего это права: у токена PBS разделение привилегий,
+          и его действующие права это пересечение с правами пользователя, так что
+          роль нужна обоим. Проверь на сервере:
+          proxmox-backup-manager acl list
+        quiet: true

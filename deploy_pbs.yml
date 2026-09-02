@@ -1,0 +1,19 @@
+---
+# Установка и настройка Proxmox Backup Server внутри уже созданного геста.
+#
+# Отдельным плейбуком от create_pbs.yml по той же причине, что и у остальных:
+# создание геста идёт на ноде Proxmox, а настройка внутрь геста по SSH, и у них
+# разные hosts.
+#
+#   ansible-playbook -i inventory.ini deploy_pbs.yml
+#
+# Дальше подключение хранилища к нодам: connect_pbs_storage.yml
+
+- name: Install and configure the backup server
+  hosts: pbs_group
+  become: true
+  gather_facts: true
+  vars:
+    pbs_pve_target: "{{ hostvars[groups['pbs_group'] | first].pbs_pve_target }}"
+  roles:
+    - pbs

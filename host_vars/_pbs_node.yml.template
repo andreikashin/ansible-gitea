@@ -1,0 +1,30 @@
+ansible_host: 192.168.1.10
+ansible_user: user
+
+# The Proxmox node the guest is created on. Changing this and re-running the
+# playbooks is how the backup server moves to another machine.
+pbs_pve_target: pve1
+
+pbs_vmid: 10076
+pbs_vm_name: pbs
+pbs_cidr: 24
+pbs_gateway: 192.168.1.1
+pbs_nameserver: 192.168.1.1
+pbs_searchdomain: example.lan
+
+# The heavy part of PBS is garbage collection and verification, not ingest.
+pbs_cores: 4
+pbs_memory: 8192
+
+pbs_system_disk: 32G
+# Datastore disk in gigabytes. Thin, so it costs nothing up front.
+pbs_data_disk: 400
+pbs_storage: local-lvm
+
+# Built from a cloud image rather than cloned from a template, so the guest can
+# be created on any node, including one with no template library of its own.
+pbs_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+pbs_pubkey: "ssh-ed25519 AAAA... your-key"
+
+pbs_storage_id: pbs
+pbs_datastore_name: backup

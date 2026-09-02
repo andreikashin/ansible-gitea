@@ -1,0 +1,76 @@
+---
+# Создаёт один API-токен и сохраняет его секрет в файл.
+#
+# Секрет показывается РОВНО ОДИН РАЗ, при создании. Поэтому здесь два условия
+# вместо одного: если токен в PBS уже есть, а файла с секретом нет, задача
+# обязана упасть с внятным текстом, а не тихо пройти. Иначе плейбук отчитается
+# об успехе, а на следующем шаге ноды не смогут подключиться, и причину придётся
+# искать вслепую.
+
+- name: Check whether the token already exists
+  command: "{{ pbs_bin_manager }} user list-tokens {{ token_user }} --output-format json"
+  register: pbs_token_list
+  changed_when: false
+  failed_when: false
+
+- name: Check whether the secret file is present
+  stat:
+    path: "{{ token_secret_file }}"
+  register: pbs_token_secret
+
+- name: Fail when the token exists but its secret is lost
+  assert:
+    that: not (pbs_token_exists and not pbs_token_secret.stat.exists)
+    fail_msg: >-
+      Токен {{ token_user }}!{{ token_name }} в PBS есть, а файла
+      {{ token_secret_file }} нет. Секрет показывается один раз и восстановлению
+      не подлежит. Удали токен и прогони плейбук заново:
+      {{ pbs_bin_manager }} user delete-token {{ token_user }} {{ token_name }}
+    quiet: true
+  vars:
+    pbs_token_exists: >-
+      {{ (pbs_token_list.rc == 0)
+         and ((token_user ~ '!' ~ token_name)
+              in (pbs_token_list.stdout | default('[]') | from_json
+                  | map(attribute='tokenid') | list)) }}
+
+- name: Generate the token
+  # --output-format json тут не поддерживается, поэтому пишем обычный вывод в
+  # файл и вынимаем оттуда UUID секрета.
+  shell: >-
+    umask 077;
+    {{ pbs_bin_manager }} user generate-token {{ token_user }} {{ token_name }}
+    > {{ token_secret_file }}.raw 2>&1
+  when: not pbs_token_secret.stat.exists
+
+- name: Extract the secret
+  shell: >-
+    umask 077;
+    grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    {{ token_secret_file }}.raw > {{ token_secret_file }}
+  when: not pbs_token_secret.stat.exists
+
+- name: Drop the raw output
+  file:
+    path: "{{ token_secret_file }}.raw"
+    state: absent
+
+- name: Lock down the secret
+  file:
+    path: "{{ token_secret_file }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Verify the secret is not empty
+  stat:
+    path: "{{ token_secret_file }}"
+  register: pbs_token_written
+
+- name: Fail on an empty secret
+  assert:
+    that: pbs_token_written.stat.size > 30
+    fail_msg: >-
+      Файл {{ token_secret_file }} пуст или подозрительно короткий.
+      Токен создан, но секрет не извлёкся, и подключить ноды будет нечем.
+    quiet: true

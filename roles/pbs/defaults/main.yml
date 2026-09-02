@@ -1,0 +1,57 @@
+---
+# Proxmox Backup Server внутри геста.
+#
+# Виртуалкой, а не пакетами на хост: бэкап-сервер не должен умирать вместе с
+# гипервизором, и его надо уметь переносить отдельно. Перенос тут не гипотеза,
+# а план: обкатывается он на стенде, а живёт потом на другой машине.
+
+pbs_datastore_name: backup
+pbs_datastore_path: /mnt/datastore/backup
+# Второй диск геста целиком под датастор. Имя устройства, а не раздел: PBS сам
+# создаёт таблицу разделов и файловую систему.
+pbs_datastore_disk: sdb
+pbs_datastore_fs: ext4
+
+# ext4, а не ZFS: под гестом уже аппаратный RAID, вторая контрольная сумма
+# бесполезна, а ARC съел бы память. Целостность чанков PBS проверяет сам.
+
+pbs_bin_manager: /usr/sbin/proxmox-backup-manager
+pbs_bin_client: /usr/bin/proxmox-backup-client
+pbs_keyring: /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+# Репозиторий без подписки. Ключ для trixie на download.proxmox.com отдельным
+# файлом не лежит, поэтому берётся с самой ноды Proxmox, где он уже есть.
+pbs_repo_uri: http://download.proxmox.com/debian/pbs
+pbs_repo_component: pbs-no-subscription
+
+# Пользователь для нод. Отдельный, а не root: ему нужно только класть бэкапы.
+pbs_backup_user: pve@pbs
+pbs_backup_token: backup
+pbs_backup_role: DatastoreBackup
+
+# Админский токен нужен клиенту: пространствами имён управляет он, а
+# proxmox-backup-manager их не умеет.
+pbs_admin_user: root@pam
+pbs_admin_token: admin
+
+pbs_secret_dir: /root
+pbs_backup_secret_file: /root/pbs-token.secret
+pbs_admin_secret_file: /root/pbs-admin.secret
+pbs_fingerprint_file: /root/pbs-fingerprint.txt
+
+# По пространству имён на ноду. Ноды standalone, кластера нет, поэтому VMID
+# уникальны только внутри ноды: 130, 131, 132 и 200 есть на двух машинах, 900 и
+# 904 тоже. PBS группирует снимки по vm/<VMID>, и без разделения два разных
+# геста сложились бы в одну группу, а retention начал бы вперемешку выкидывать
+# чужие снимки.
+pbs_namespaces: "{{ groups['pve_all'] | default([]) }}"
+
+# Обслуживание. Без первого места физически не освобождается, без второго
+# retention не применяется, без третьего целостность никто не проверяет.
+pbs_gc_schedule: "sun 06:00"
+pbs_prune_schedule: "05:00"
+pbs_verify_schedule: "*-*-01 07:00"
+
+pbs_keep_daily: 7
+pbs_keep_weekly: 4
+pbs_keep_monthly: 6

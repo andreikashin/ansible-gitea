@@ -1,0 +1,210 @@
+---
+# Ставит и настраивает PBS внутри уже созданного геста (см. create_pbs.yml).
+
+- name: Read the Proxmox archive keyring from the hypervisor
+  slurp:
+    src: "{{ pbs_keyring }}"
+  delegate_to: "{{ pbs_pve_target }}"
+  register: pbs_keyring_blob
+  # Ключ берётся с ноды, а не скачивается: для trixie отдельного файла на
+  # download.proxmox.com нет, там лежат только bookworm и bullseye, а на самой
+  # ноде нужный ключ уже установлен и уже доверенный.
+
+- name: Install the Proxmox archive keyring
+  copy:
+    content: "{{ pbs_keyring_blob.content | b64decode }}"
+    dest: "{{ pbs_keyring }}"
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Add the Proxmox backup server repository
+  template:
+    src: proxmox.sources.j2
+    dest: /etc/apt/sources.list.d/proxmox.sources
+    owner: root
+    group: root
+    mode: '0644'
+  register: pbs_repo
+
+- name: Refresh the package index
+  apt:
+    update_cache: true
+  when: pbs_repo.changed
+
+- name: Install the backup server and client
+  apt:
+    name:
+      - proxmox-backup-server
+      # Клиент отдельным пакетом: пространствами имён управляет он, а
+      # proxmox-backup-manager такой команды не имеет вовсе.
+      - proxmox-backup-client
+    state: present
+
+# Пакет прописывает себе enterprise-репозиторий, который без подписки отдаёт 401
+# и роняет apt update целиком. Заметить это трудно: пакеты всё равно ставятся из
+# no-subscription, ошибка молчит и всплывает в самый неудобный момент, когда
+# понадобится обновление. Глушим сразу после установки, потому что до неё файла
+# ещё не существует.
+- name: Disable the enterprise repository
+  lineinfile:
+    path: /etc/apt/sources.list.d/pbs-enterprise.sources
+    line: 'Enabled: false'
+    regexp: '^Enabled:'
+    state: present
+
+- name: Prove that apt is clean
+  apt:
+    update_cache: true
+  changed_when: false
+
+- name: Read the certificate fingerprint
+  command: "{{ pbs_bin_manager }} cert info"
+  register: pbs_cert
+  changed_when: false
+
+- name: Extract the fingerprint
+  set_fact:
+    pbs_fingerprint: "{{ pbs_cert.stdout | regex_search('Fingerprint \\(sha256\\):\\s*([0-9a-f:]+)', '\\1') | first }}"
+
+# Отпечаток кладём в файл: он нужен и клиенту здесь, и каждой ноде при
+# подключении хранилища, а сертификат самоподписанный, без отпечатка соединение
+# не откроется.
+- name: Save the fingerprint for the connect playbook
+  copy:
+    content: "{{ pbs_fingerprint }}\n"
+    dest: "{{ pbs_fingerprint_file }}"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: List existing datastores
+  command: "{{ pbs_bin_manager }} datastore list --output-format json"
+  register: pbs_stores
+  changed_when: false
+
+# proxmox-backup-manager disk fs create делает три вещи разом: таблицу
+# разделов, файловую систему и systemd-юнит монтирования. Руками это три шага,
+# и забытый юнит означает пустой датастор после первой же перезагрузки.
+- name: Create the datastore filesystem and register it
+  command: >-
+    {{ pbs_bin_manager }} disk fs create {{ pbs_datastore_name }}
+    --disk {{ pbs_datastore_disk }}
+    --filesystem {{ pbs_datastore_fs }}
+    --add-datastore true
+  when: pbs_datastore_name not in (pbs_stores.stdout | from_json | map(attribute='name') | list)
+
+- name: Verify the datastore is mounted
+  command: "findmnt --noheadings --target {{ pbs_datastore_path }}"
+  register: pbs_mount
+  changed_when: false
+  failed_when: pbs_datastore_path not in pbs_mount.stdout
+
+- name: List existing users
+  command: "{{ pbs_bin_manager }} user list --output-format json"
+  register: pbs_users
+  changed_when: false
+
+- name: Create the backup user for the nodes
+  command: >-
+    {{ pbs_bin_manager }} user create {{ pbs_backup_user }}
+    --comment "PVE nodes, backup only"
+  when: pbs_backup_user not in (pbs_users.stdout | from_json | map(attribute='userid') | list)
+
+- name: Look for existing secrets
+  stat:
+    path: "{{ item }}"
+  register: pbs_secrets
+  loop:
+    - "{{ pbs_backup_secret_file }}"
+    - "{{ pbs_admin_secret_file }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Create the API tokens
+  include_tasks: token.yml
+  vars:
+    token_user: "{{ item.user }}"
+    token_name: "{{ item.name }}"
+    token_secret_file: "{{ item.file }}"
+  loop:
+    - { user: "{{ pbs_backup_user }}", name: "{{ pbs_backup_token }}", file: "{{ pbs_backup_secret_file }}" }
+    - { user: "{{ pbs_admin_user }}", name: "{{ pbs_admin_token }}", file: "{{ pbs_admin_secret_file }}" }
+  loop_control:
+    label: "{{ item.user }}!{{ item.name }}"
+
+# Права выдаются И пользователю, И токену. У токена включено разделение
+# привилегий, и его действующие права это ПЕРЕСЕЧЕНИЕ с правами пользователя.
+# Дать только токену значит дать пересечение с пустым множеством: датастор
+# просто не будет виден, а PVE скажет "Cannot find datastore".
+- name: Grant the datastore role to the user and the token
+  command: >-
+    {{ pbs_bin_manager }} acl update /datastore/{{ pbs_datastore_name }}
+    {{ pbs_backup_role }} --auth-id "{{ item }}"
+  loop:
+    - "{{ pbs_backup_user }}"
+    - "{{ pbs_backup_user }}!{{ pbs_backup_token }}"
+  changed_when: true
+
+- name: Grant admin on the whole datastore tree to the admin token
+  command: >-
+    {{ pbs_bin_manager }} acl update / Admin
+    --auth-id "{{ pbs_admin_user }}!{{ pbs_admin_token }}"
+  changed_when: true
+
+# Секрет лежит на самом госте, поэтому читаем его slurp-ом, а не lookup-ом:
+# lookup выполняется на управляющей машине, где этого файла нет и не должно быть.
+- name: Read the admin token secret
+  slurp:
+    src: "{{ pbs_admin_secret_file }}"
+  register: pbs_admin_blob
+  no_log: true
+
+- name: Create one namespace per node
+  include_tasks: namespace.yml
+  loop: "{{ pbs_namespaces }}"
+  loop_control:
+    loop_var: pbs_ns
+
+- name: Set the garbage collection schedule
+  command: >-
+    {{ pbs_bin_manager }} datastore update {{ pbs_datastore_name }}
+    --gc-schedule "{{ pbs_gc_schedule }}"
+  changed_when: true
+  # Без неё удалённые retention-ом снимки не освобождают место физически,
+  # датастор просто растёт до упора.
+
+- name: List prune jobs
+  command: "{{ pbs_bin_manager }} prune-job list --output-format json"
+  register: pbs_prune_jobs
+  changed_when: false
+
+- name: Create the prune job
+  command: >-
+    {{ pbs_bin_manager }} prune-job create pj-{{ pbs_datastore_name }}
+    --store {{ pbs_datastore_name }}
+    --schedule "{{ pbs_prune_schedule }}"
+    --keep-daily {{ pbs_keep_daily }}
+    --keep-weekly {{ pbs_keep_weekly }}
+    --keep-monthly {{ pbs_keep_monthly }}
+  when: "'pj-' ~ pbs_datastore_name not in (pbs_prune_jobs.stdout | from_json | map(attribute='id') | list)"
+
+- name: List verify jobs
+  command: "{{ pbs_bin_manager }} verify-job list --output-format json"
+  register: pbs_verify_jobs
+  changed_when: false
+
+- name: Create the verify job
+  command: >-
+    {{ pbs_bin_manager }} verify-job create vj-{{ pbs_datastore_name }}
+    --store {{ pbs_datastore_name }}
+    --schedule "{{ pbs_verify_schedule }}"
+  when: "'vj-' ~ pbs_datastore_name not in (pbs_verify_jobs.stdout | from_json | map(attribute='id') | list)"
+
+- name: Report the result
+  debug:
+    msg:
+      - "Датастор {{ pbs_datastore_name }} на {{ pbs_datastore_path }}"
+      - "Отпечаток: {{ pbs_fingerprint }}"
+      - "Пространства имён: {{ pbs_namespaces | join(', ') }}"
+      - "Дальше: ansible-playbook -i inventory.ini connect_pbs_storage.yml"

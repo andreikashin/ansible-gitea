@@ -1,0 +1,159 @@
+---
+# Создание геста под Proxmox Backup Server из cloud-образа Debian.
+#
+# Почему из образа, а не клонированием шаблона, как create_observability.yml:
+# гест должен подниматься на ЛЮБОЙ ноде, включая ту, где шаблонов нет вовсе.
+# Это не гипотеза, а рабочий сценарий: сервер обкатывается на стенде и потом
+# переносится на другую машину, у которой своей библиотеки шаблонов может не
+# быть.
+#
+# Виртуалкой, а не пакетами на хост: бэкап-сервер не должен умирать вместе с
+# гипервизором и должен переноситься отдельно от него.
+#
+#   ansible-playbook -i inventory.ini create_pbs.yml
+#   ansible-playbook -i inventory.ini create_pbs.yml -e pbs_pve_target=pve5
+
+- name: Provision the backup server guest on Proxmox
+  hosts: "{{ pbs_pve_target | default('pve2') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    pbs_vars: "{{ hostvars[groups['pbs_group'] | first] }}"
+    pbs_vmid: "{{ pbs_vars.pbs_vmid }}"
+    pbs_vm_name: "{{ pbs_vars.pbs_vm_name }}"
+    pbs_ip: "{{ pbs_vars.ansible_host }}"
+    pbs_cidr: "{{ pbs_vars.pbs_cidr }}"
+    pbs_gateway: "{{ pbs_vars.pbs_gateway }}"
+    pbs_nameserver: "{{ pbs_vars.pbs_nameserver }}"
+    pbs_searchdomain: "{{ pbs_vars.pbs_searchdomain }}"
+    pbs_ciuser: "{{ pbs_vars.ansible_user }}"
+    pbs_cores: "{{ pbs_vars.pbs_cores }}"
+    pbs_memory: "{{ pbs_vars.pbs_memory }}"
+    pbs_system_disk: "{{ pbs_vars.pbs_system_disk }}"
+    pbs_data_disk: "{{ pbs_vars.pbs_data_disk }}"
+    pbs_storage: "{{ pbs_vars.pbs_storage }}"
+    pbs_pubkey: "{{ pbs_vars.pbs_pubkey }}"
+    pbs_image_url: "{{ pbs_vars.pbs_image_url }}"
+    pbs_image_path: "/var/lib/vz/template/{{ pbs_image_url | basename }}"
+
+  tasks:
+    - name: Fetch the Debian cloud image
+      get_url:
+        url: "{{ pbs_image_url }}"
+        dest: "{{ pbs_image_path }}"
+        mode: '0644'
+      # get_url с существующим dest ничего не качает повторно.
+
+    - name: Check whether the VMID is already taken
+      command: "qm config {{ pbs_vmid }}"
+      register: pbs_existing
+      changed_when: false
+      failed_when: false
+
+    # Занятый VMID не трогаем никогда: на том конце может оказаться работающий
+    # сервис, и перезапись прошла бы молча.
+    - name: Create the virtual machine
+      command:
+        argv:
+          - qm
+          - create
+          - "{{ pbs_vmid }}"
+          - --name
+          - "{{ pbs_vm_name }}"
+          - --memory
+          - "{{ pbs_memory }}"
+          - --cores
+          - "{{ pbs_cores }}"
+          - --sockets
+          - "1"
+          - --net0
+          - "virtio,bridge=vmbr0"
+          - --scsihw
+          - virtio-scsi-single
+          - --ostype
+          - l26
+          - --agent
+          - "1"
+          - --onboot
+          - "1"
+          - --description
+          - "Proxmox Backup Server. Datastore on the second disk."
+      when: pbs_existing.rc != 0
+      # Машина по умолчанию i440fx, а не q35: под q35 cloud-init CD не читается,
+      # датасорс не находится, и гест поднимается без сети и с hostname
+      # localhost. Проверено на этом стенде, см. §2.2 плана.
+
+    - name: Import the cloud image as the system disk
+      command: >-
+        qm set {{ pbs_vmid }}
+        --scsi0 {{ pbs_storage }}:0,import-from={{ pbs_image_path }},discard=on
+      when: pbs_existing.rc != 0
+
+    - name: Grow the system disk
+      command: "qm disk resize {{ pbs_vmid }} scsi0 {{ pbs_system_disk }}"
+      when: pbs_existing.rc != 0
+
+    # Отдельный диск под датастор, а не каталог на системном: датастор так
+    # переезжает и растёт независимо от системы, а заполнение бэкапами не
+    # роняет саму ОС бэкап-сервера.
+    - name: Add the datastore disk
+      command: >-
+        qm set {{ pbs_vmid }}
+        --scsi1 {{ pbs_storage }}:{{ pbs_data_disk }},discard=on
+      when: pbs_existing.rc != 0
+
+    - name: Attach cloud-init and set the boot order
+      command: >-
+        qm set {{ pbs_vmid }}
+        --ide2 {{ pbs_storage }}:cloudinit --boot order=scsi0
+      when: pbs_existing.rc != 0
+
+    - name: Write the public key for cloud-init
+      copy:
+        content: "{{ pbs_pubkey }}\n"
+        dest: "/root/pbs-{{ pbs_vmid }}.pub"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Apply user, key and static addressing
+      command:
+        argv:
+          - qm
+          - set
+          - "{{ pbs_vmid }}"
+          - --ciuser
+          - "{{ pbs_ciuser }}"
+          - --sshkeys
+          - "/root/pbs-{{ pbs_vmid }}.pub"
+          - --ipconfig0
+          - "ip={{ pbs_ip }}/{{ pbs_cidr }},gw={{ pbs_gateway }}"
+          - --nameserver
+          - "{{ pbs_nameserver }}"
+          - --searchdomain
+          - "{{ pbs_searchdomain }}"
+
+    - name: Start the guest
+      command: "qm start {{ pbs_vmid }}"
+      register: pbs_start
+      changed_when: "'already running' not in (pbs_start.stderr | default(''))"
+      failed_when:
+        - pbs_start.rc != 0
+        - "'already running' not in (pbs_start.stderr | default(''))"
+
+    - name: Wait until SSH answers
+      wait_for:
+        host: "{{ pbs_ip }}"
+        port: 22
+        timeout: 300
+        delay: 10
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      debug:
+        msg: >-
+          Гест {{ pbs_vmid }} {{ pbs_vm_name }} на {{ inventory_hostname }},
+          адрес {{ pbs_ip }}. Дальше:
+          ansible-playbook -i inventory.ini deploy_pbs.yml
