@@ -16,6 +16,8 @@ jenkins_gitea_repo_branch: main
 jenkins_harbor_service_user: robot$global-jenkins
 jenkins_harbor_credentials_id: harbor-auth
 jenkins_harbor_credentials_description: Harbor credentials for Jenkins robot access
+jenkins_k3s_kubeconfig_credentials_id: k3s-kubeconfig
+jenkins_k3s_kubeconfig_credentials_description: k3s kubeconfig used by the Helm deploy stages
 
 jenkins_ip_rotation_release_keystore_credentials_id: ip-rotation-release-keystore
 jenkins_ip_rotation_release_keystore_credentials_description: IP Rotation release keystore for Android signing
