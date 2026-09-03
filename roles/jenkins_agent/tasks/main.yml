@@ -177,3 +177,73 @@
   changed_when: true
   failed_when: jenkins_agent_svc_restart.rc != 0 or (jenkins_agent_svc_restart.stdout | from_json).exitcode | default(1) != 0
   when: jenkins_agent_manage_service | bool and (jenkins_agent_svc_changed | default(false))
+
+# --- 4. deploy tooling (kubectl + helm) -------------------------------------
+# The Helm deploy stages run their shell on this agent, so `kubectl` and `helm`
+# have to exist here or the stage dies with "command not found". Both are
+# installed as pinned release binaries with their published sha256 checked
+# before install. The guest prints "installed" or "unchanged", which is what
+# drives changed_when, so a re-run of the role is a no-op.
+
+- name: Install kubectl on the agent
+  ansible.builtin.command:
+    argv:
+      - qm
+      - guest
+      - exec
+      - "{{ jenkins_agent_vmid }}"
+      - "--timeout"
+      - "300"
+      - "--"
+      - /bin/sh
+      - "-c"
+      - |
+        set -e
+        if {{ jenkins_agent_kubectl_bin }} version --client 2>/dev/null | grep -q "{{ jenkins_agent_kubectl_version }}"; then
+          echo unchanged
+          exit 0
+        fi
+        url="https://dl.k8s.io/release/{{ jenkins_agent_kubectl_version }}/bin/linux/{{ jenkins_agent_tools_arch }}/kubectl"
+        curl -fsSL -o /tmp/kubectl "$url"
+        curl -fsSL -o /tmp/kubectl.sha256 "$url.sha256"
+        echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c -
+        install -m 0755 /tmp/kubectl {{ jenkins_agent_kubectl_bin }}
+        rm -f /tmp/kubectl /tmp/kubectl.sha256
+        echo installed
+  register: jenkins_agent_kubectl_install
+  changed_when: "'installed' in ((jenkins_agent_kubectl_install.stdout | from_json)['out-data'] | default(''))"
+  failed_when: jenkins_agent_kubectl_install.rc != 0 or (jenkins_agent_kubectl_install.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_manage_deploy_tools | bool
+
+- name: Install helm on the agent
+  ansible.builtin.command:
+    argv:
+      - qm
+      - guest
+      - exec
+      - "{{ jenkins_agent_vmid }}"
+      - "--timeout"
+      - "300"
+      - "--"
+      - /bin/sh
+      - "-c"
+      - |
+        set -e
+        if {{ jenkins_agent_helm_bin }} version --short 2>/dev/null | grep -q "{{ jenkins_agent_helm_version }}"; then
+          echo unchanged
+          exit 0
+        fi
+        url="https://get.helm.sh/helm-{{ jenkins_agent_helm_version }}-linux-{{ jenkins_agent_tools_arch }}.tar.gz"
+        curl -fsSL -o /tmp/helm.tgz "$url"
+        curl -fsSL -o /tmp/helm.tgz.sha256 "$url.sha256"
+        echo "$(cat /tmp/helm.tgz.sha256)  /tmp/helm.tgz" | sha256sum -c -
+        rm -rf /tmp/helm-unpack
+        mkdir -p /tmp/helm-unpack
+        tar -xzf /tmp/helm.tgz -C /tmp/helm-unpack
+        install -m 0755 /tmp/helm-unpack/linux-{{ jenkins_agent_tools_arch }}/helm {{ jenkins_agent_helm_bin }}
+        rm -rf /tmp/helm.tgz /tmp/helm.tgz.sha256 /tmp/helm-unpack
+        echo installed
+  register: jenkins_agent_helm_install
+  changed_when: "'installed' in ((jenkins_agent_helm_install.stdout | from_json)['out-data'] | default(''))"
+  failed_when: jenkins_agent_helm_install.rc != 0 or (jenkins_agent_helm_install.stdout | from_json).exitcode | default(1) != 0
+  when: jenkins_agent_manage_deploy_tools | bool

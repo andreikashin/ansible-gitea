@@ -45,3 +45,17 @@ jenkins_agent_docker_daemon:
     gc:
       enabled: true
       defaultKeepStorage: "{{ jenkins_agent_gc_build_cache_keep }}"
+
+# --- Deploy tooling (kubectl + helm) -----------------------------------------
+# The Helm deploy stages of the build jobs run their kubectl/helm shell on the
+# agent, not on the cluster, so both binaries have to live here. They are
+# fetched as pinned, checksum-verified release artifacts instead of distro
+# packages: kubectl is kept on the cluster's own minor version (k3s_version in
+# group_vars/k3s_cluster.yml), and pinning keeps a rebuilt agent identical to
+# the current one. Helm stays on the 3.x line the charts are written against.
+jenkins_agent_manage_deploy_tools: true
+jenkins_agent_tools_arch: amd64
+jenkins_agent_kubectl_version: v1.36.4
+jenkins_agent_kubectl_bin: /usr/local/bin/kubectl
+jenkins_agent_helm_version: v3.21.4
+jenkins_agent_helm_bin: /usr/local/bin/helm
