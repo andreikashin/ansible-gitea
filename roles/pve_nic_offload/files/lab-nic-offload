@@ -1,49 +1,77 @@
 #!/bin/sh
-# Выключает аппаратную разгрузку на картах, чей драйвер известен порчей данных.
+# Выключает аппаратную разгрузку на картах, чей драйвер подозревается в порче
+# данных, И на мостах, которые на этих картах стоят.
 #
-# Что наблюдалось. Бэкап с pve1 в PBS падал с "backup write data failed:
-# protocol canceled", а на стороне сервера в журнале лежало
-# "SSL routines: decryption failed or bad record mac". Это значит, что биты
-# изменились в полёте: TLS проверяет целостность и поймал подмену.
+# Что наблюдалось. Бэкап в PBS падал с "backup write data failed: protocol
+# canceled", а на стороне сервера в журнале лежало "SSL routines: decryption
+# failed or bad record mac". Это значит, что биты изменились в полёте: TLS
+# проверяет целостность и поймал подмену.
 #
-# При этом счётчики Ethernet чистые, CRC-ошибок ноль. Так и должно быть, если
-# портит не провод, а сам движок разгрузки в карте: кадр собирается уже после
-# того, как контрольная сумма посчитана, и получатель видит формально
-# корректный кадр с испорченным содержимым.
+# Счётчики Ethernet при этом чистые, CRC-ошибок ноль. Так и бывает, когда портит
+# не провод: кадр собирается движком разгрузки уже после подсчёта контрольной
+# суммы, и получатель видит формально корректный кадр с испорченным содержимым.
 #
-# Проверено прямым экспериментом: с включённой разгрузкой бэкап падал дважды
-# подряд, с выключенной прошёл за 196 секунд. Тот же путь до этого ронял заливку
-# образов в Harbor с "blob upload invalid", что тогда списали на загрузку канала.
+# Мост обрабатывается ОБЯЗАТЕЛЬНО, и это не мелочь. Трафик хоста (а vzdump это
+# хост) уходит через vmbr0, сегментацию делает мост, и выключенная разгрузка на
+# одной лишь физической карте задачу не решает. Первая версия скрипта этого не
+# учитывала, и бэкап продолжал падать при "уже исправленной" карте.
 #
 # Цена отключения близка к нулю: разгрузка окупается на гигабите и выше, а линк
-# в лабе сейчас стомегабитный, и его насыщает даже процессор G7.
+# в лабе сейчас стомегабитный.
 #
-# Скрипт идемпотентен, ethtool на уже выключенном параметре ничего не делает.
+# Скрипт идемпотентен: ethtool на уже выключенном параметре ничего не делает.
 set -u
 
 DRIVERS="${LAB_NIC_BAD_DRIVERS:-bnx2}"
 FEATURES="${LAB_NIC_FEATURES:-tso off gso off gro off}"
 
+driver_of() {
+  ethtool -i "$1" 2>/dev/null | awk '/^driver:/{print $2}'
+}
+
+is_bad_driver() {
+  _d="$1"
+  [ -n "$_d" ] || return 1
+  for bad in $DRIVERS; do
+    [ "$_d" = "$bad" ] && return 0
+  done
+  return 1
+}
+
+apply() {
+  # shellcheck disable=SC2086
+  if ethtool -K "$1" $FEATURES 2>/dev/null; then
+    echo "lab-nic-offload: $1 ($2): $FEATURES"
+    return 0
+  fi
+  echo "lab-nic-offload: $1 ($2): не удалось применить" >&2
+  return 1
+}
+
 changed=0
+
+# 1. Физические интерфейсы с подозрительным драйвером.
 for path in /sys/class/net/*; do
   iface=$(basename "$path")
   case "$iface" in
     lo|vmbr*|tap*|fwbr*|fwpr*|fwln*|veth*|bond*) continue ;;
   esac
   [ -e "$path/device" ] || continue
+  drv=$(driver_of "$iface")
+  if is_bad_driver "$drv"; then
+    apply "$iface" "$drv" && changed=$((changed + 1))
+  fi
+done
 
-  drv=$(ethtool -i "$iface" 2>/dev/null | awk '/^driver:/{print $2}')
-  [ -n "$drv" ] || continue
-
-  for bad in $DRIVERS; do
-    if [ "$drv" = "$bad" ]; then
-      # shellcheck disable=SC2086
-      if ethtool -K "$iface" $FEATURES 2>/dev/null; then
-        echo "lab-nic-offload: $iface ($drv): $FEATURES"
-        changed=$((changed + 1))
-      else
-        echo "lab-nic-offload: $iface ($drv): не удалось применить" >&2
-      fi
+# 2. Мосты, у которых хотя бы один член стоит на таком драйвере.
+for path in /sys/class/net/*; do
+  br=$(basename "$path")
+  [ -d "$path/bridge" ] || continue
+  for m in "$path"/brif/*; do
+    [ -e "$m" ] || continue
+    member=$(basename "$m")
+    if is_bad_driver "$(driver_of "$member")"; then
+      apply "$br" "мост над $member" && changed=$((changed + 1))
       break
     fi
   done
