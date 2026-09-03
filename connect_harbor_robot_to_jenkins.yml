@@ -9,6 +9,14 @@
     jenkins_inventory_host: "{{ groups['jenkins_group'] | first }}"
     jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
     jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    # The jenkins_* settings live in group_vars/jenkins_group.yml, which is not
+    # in scope when this play targets the pve host, so they come from the
+    # Jenkins inventory host's vars.
+    jenkins_install_dir: "{{ jenkins_inventory_vars.jenkins_install_dir }}"
+    jenkins_http_port: "{{ jenkins_inventory_vars.jenkins_http_port }}"
+    jenkins_harbor_service_user: "{{ jenkins_inventory_vars.jenkins_harbor_service_user | default('') }}"
+    jenkins_harbor_credentials_id: "{{ jenkins_inventory_vars.jenkins_harbor_credentials_id | default('') }}"
+    jenkins_harbor_credentials_description: "{{ jenkins_inventory_vars.jenkins_harbor_credentials_description }}"
     jenkins_credentials_file: "{{ jenkins_install_dir }}/data/credentials.xml"
     # Rendered on the PVE node, then pushed into the Jenkins CT via pct.
     harbor_credential_script_stage: "/tmp/20-harbor-auth.groovy"

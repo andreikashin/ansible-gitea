@@ -12,6 +12,13 @@
     jenkins_inventory_vars: "{{ hostvars[jenkins_inventory_host] }}"
     gitea_ctid: "{{ gitea_inventory_vars.gitea_ctid }}"
     jenkins_ctid: "{{ jenkins_inventory_vars.jenkins_ctid }}"
+    # The jenkins_* settings live in group_vars/jenkins_group.yml, which is not
+    # in scope when this play targets the pve host, so they come from the
+    # Jenkins inventory host's vars.
+    jenkins_install_dir: "{{ jenkins_inventory_vars.jenkins_install_dir }}"
+    jenkins_http_port: "{{ jenkins_inventory_vars.jenkins_http_port }}"
+    jenkins_gitea_service_user: "{{ jenkins_inventory_vars.jenkins_gitea_service_user }}"
+    jenkins_gitea_credentials_id: "{{ jenkins_inventory_vars.jenkins_gitea_credentials_id }}"
     gitea_base_url: "https://{{ gitea_inventory_vars.node_domain }}"
     gitea_service_user: "{{ jenkins_gitea_service_user }}"
     jenkins_job_name: "{{ gitea_repo_name }}-ci"
