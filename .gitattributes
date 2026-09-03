@@ -11,3 +11,4 @@
 *.timer text eol=lf
 roles/pg_dump/files/pg-dump text eol=lf
 roles/gitea_backup/files/gitea-backup text eol=lf
+roles/pve_nic_offload/files/lab-nic-offload text eol=lf

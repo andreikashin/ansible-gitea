@@ -1,0 +1,107 @@
+---
+# Не настроено - молча ничего не делаем. Нода без доставки это осознанное
+# состояние, а не ошибка: доставка включается заданием двух переменных.
+- name: Skip when Telegram is not configured
+  meta: end_host
+  when: >-
+    (pve_notify_telegram_token | default('') | length) == 0
+    or (pve_notify_telegram_chat_id | default('') | string | length) == 0
+
+- name: Read the existing webhook endpoints
+  command: pvesh get /cluster/notifications/endpoints/webhook --output-format json
+  register: pve_notify_endpoints
+  changed_when: false
+  failed_when: false
+
+- name: Read the existing matchers
+  command: pvesh get /cluster/notifications/matchers --output-format json
+  register: pve_notify_matchers
+  changed_when: false
+
+# Токен уходит в secret, а не в URL открытым текстом: Proxmox не отдаёт значения
+# секретов обратно через API, а URL показывает кому угодно с правами на чтение
+# конфигурации.
+- name: Create the webhook endpoint
+  command: >-
+    pvesh create /cluster/notifications/endpoints/webhook
+    --name {{ pve_notify_endpoint_name }}
+    --method post
+    --url "https://api.telegram.org/bot{% raw %}{{ secrets.token }}{% endraw %}/sendMessage"
+    --header "name=Content-Type,value={{ 'application/json' | b64encode }}"
+    --secret "name=token,value={{ pve_notify_telegram_token | b64encode }}"
+    --body "{{ pve_notify_body | to_json | b64encode }}"
+    --comment "Telegram, тот же бот что у продуктового"
+  vars:
+    # Собирается словарём и сериализуется to_json НАМЕРЕННО. Написанная строкой
+    # JSON-подобная запись подхватывается нативной типизацией Ansible, приезжает
+    # обратно python-словарём и после b64encode превращается в
+    # {'chat_id': '...', 'disable_web_page_preview': True}: одинарные кавычки и
+    # True вместо true. Telegram на это отвечает 400, и понять почему по логам
+    # невозможно.
+    pve_notify_body:
+      chat_id: "{{ pve_notify_telegram_chat_id | string }}"
+      text: "{% raw %}{{ escape title }}{% endraw %}\n\n{% raw %}{{ escape message }}{% endraw %}"
+      disable_web_page_preview: true
+  when: >-
+    pve_notify_endpoint_name not in
+    ((pve_notify_endpoints.stdout | default('[]') | from_json) | map(attribute='name') | list)
+  no_log: true
+
+# Тело чиним и на уже существующей цели: удалить её нельзя, пока на неё
+# ссылается матчер, а разъехавшееся тело даёт 400 от Telegram, который в логах
+# Proxmox выглядит просто как "could not test target".
+- name: Fix the body on an existing endpoint
+  command: >-
+    pvesh set /cluster/notifications/endpoints/webhook/{{ pve_notify_endpoint_name }}
+    --body "{{ pve_notify_body | to_json | b64encode }}"
+  vars:
+    pve_notify_body:
+      chat_id: "{{ pve_notify_telegram_chat_id | string }}"
+      text: "{% raw %}{{ escape title }}{% endraw %}\n\n{% raw %}{{ escape message }}{% endraw %}"
+      disable_web_page_preview: true
+    pve_notify_stored: >-
+      {{ ((pve_notify_endpoints.stdout | default('[]') | from_json)
+          | selectattr('name', 'equalto', pve_notify_endpoint_name)
+          | map(attribute='body') | list | first) | default('') }}
+  when:
+    - pve_notify_endpoint_name in ((pve_notify_endpoints.stdout | default('[]') | from_json) | map(attribute='name') | list)
+    - pve_notify_stored != (pve_notify_body | to_json | b64encode)
+  no_log: true
+
+- name: Create the matcher
+  command: >-
+    pvesh create /cluster/notifications/matchers
+    --name {{ pve_notify_matcher_name }}
+    --target {{ pve_notify_endpoint_name }}
+    --match-severity {{ pve_notify_severities }}
+    --mode all
+    --comment "Только проблемы, успешные прогоны не шлём"
+  when: >-
+    pve_notify_matcher_name not in
+    ((pve_notify_matchers.stdout | from_json) | map(attribute='name') | list)
+
+# Встроенный матчер шлёт вообще всё в почту root. Отключаем: иначе на каждый
+# успешный бэкап пишется письмо в ящик, который никто не открывает, и в логах
+# копятся ошибки доставки.
+- name: Disable the built-in mail matcher
+  command: pvesh set /cluster/notifications/matchers/default-matcher --disable 1
+  register: pve_notify_disable
+  changed_when: true
+  failed_when:
+    - pve_notify_disable.rc != 0
+    - "'no such' not in (pve_notify_disable.stderr | default('') | lower)"
+
+- name: Verify the target is registered
+  command: pvesh get /cluster/notifications/targets --output-format json
+  register: pve_notify_targets
+  changed_when: false
+
+- name: Fail when the target did not appear
+  assert:
+    that: >-
+      pve_notify_endpoint_name in
+      ((pve_notify_targets.stdout | from_json) | map(attribute='name') | list)
+    fail_msg: >-
+      На {{ inventory_hostname }} цель {{ pve_notify_endpoint_name }} не
+      зарегистрирована. Проверь: pvesh get /cluster/notifications/targets
+    quiet: true

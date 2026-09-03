@@ -1,0 +1,21 @@
+---
+# Выключает аппаратную разгрузку на сетевых картах, портящих данные.
+#
+# Найдено 03.09.2026: бэкап с pve1 в PBS падал с "backup write data failed:
+# protocol canceled", а сервер в тот же момент писал "SSL routines: decryption
+# failed or bad record mac". TLS проверяет целостность и поймал изменившиеся в
+# полёте биты. Счётчики Ethernet при этом чистые: CRC-ошибок ноль, потому что
+# портит не провод, а движок разгрузки в самой карте, и кадр уходит формально
+# корректным.
+#
+# Проверено экспериментом, а не догадкой: с включённой разгрузкой два падения
+# подряд, с выключенной прошло за 196 секунд.
+#
+#   ansible-playbook -i inventory.ini deploy_nic_offload.yml
+
+- name: Disable offloads on NICs known to corrupt data
+  hosts: pve_all
+  become: true
+  gather_facts: false
+  roles:
+    - pve_nic_offload

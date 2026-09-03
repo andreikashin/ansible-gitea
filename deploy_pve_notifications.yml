@@ -1,0 +1,27 @@
+---
+# Уведомления нод Proxmox в Telegram.
+#
+# Закрывает самую тихую дыру в цепочке: ночные задания vzdump по умолчанию
+# отчитываются в mail-to-root, то есть в локальный ящик, который никто не
+# читает. Упавший бэкап при этом выглядит ровно как удавшийся.
+#
+# Alertmanager настраивается отдельно (deploy_observability.yml), у него свой
+# нативный telegram_configs. Бот и чат при этом одни и те же: заводить второго
+# ради одного оператора незачем.
+#
+#   ansible-playbook -i inventory.ini deploy_pve_notifications.yml
+
+- name: Send Proxmox notifications to Telegram
+  hosts: pve_all
+  become: true
+  gather_facts: false
+
+  # Секрет живёт в одном месте, в host_vars ноды мониторинга, и оттуда же его
+  # берёт Alertmanager. Второй копии заводить не надо: разъедутся.
+  vars:
+    pve_notify_obs: "{{ hostvars[groups['observability_group'] | first] }}"
+    pve_notify_telegram_token: "{{ pve_notify_obs.lab_telegram_bot_token | default('') }}"
+    pve_notify_telegram_chat_id: "{{ pve_notify_obs.lab_telegram_chat_id | default('') }}"
+
+  roles:
+    - pve_notifications

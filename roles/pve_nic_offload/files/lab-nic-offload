@@ -1,0 +1,53 @@
+#!/bin/sh
+# Выключает аппаратную разгрузку на картах, чей драйвер известен порчей данных.
+#
+# Что наблюдалось. Бэкап с pve1 в PBS падал с "backup write data failed:
+# protocol canceled", а на стороне сервера в журнале лежало
+# "SSL routines: decryption failed or bad record mac". Это значит, что биты
+# изменились в полёте: TLS проверяет целостность и поймал подмену.
+#
+# При этом счётчики Ethernet чистые, CRC-ошибок ноль. Так и должно быть, если
+# портит не провод, а сам движок разгрузки в карте: кадр собирается уже после
+# того, как контрольная сумма посчитана, и получатель видит формально
+# корректный кадр с испорченным содержимым.
+#
+# Проверено прямым экспериментом: с включённой разгрузкой бэкап падал дважды
+# подряд, с выключенной прошёл за 196 секунд. Тот же путь до этого ронял заливку
+# образов в Harbor с "blob upload invalid", что тогда списали на загрузку канала.
+#
+# Цена отключения близка к нулю: разгрузка окупается на гигабите и выше, а линк
+# в лабе сейчас стомегабитный, и его насыщает даже процессор G7.
+#
+# Скрипт идемпотентен, ethtool на уже выключенном параметре ничего не делает.
+set -u
+
+DRIVERS="${LAB_NIC_BAD_DRIVERS:-bnx2}"
+FEATURES="${LAB_NIC_FEATURES:-tso off gso off gro off}"
+
+changed=0
+for path in /sys/class/net/*; do
+  iface=$(basename "$path")
+  case "$iface" in
+    lo|vmbr*|tap*|fwbr*|fwpr*|fwln*|veth*|bond*) continue ;;
+  esac
+  [ -e "$path/device" ] || continue
+
+  drv=$(ethtool -i "$iface" 2>/dev/null | awk '/^driver:/{print $2}')
+  [ -n "$drv" ] || continue
+
+  for bad in $DRIVERS; do
+    if [ "$drv" = "$bad" ]; then
+      # shellcheck disable=SC2086
+      if ethtool -K "$iface" $FEATURES 2>/dev/null; then
+        echo "lab-nic-offload: $iface ($drv): $FEATURES"
+        changed=$((changed + 1))
+      else
+        echo "lab-nic-offload: $iface ($drv): не удалось применить" >&2
+      fi
+      break
+    fi
+  done
+done
+
+[ "$changed" -gt 0 ] || echo "lab-nic-offload: подходящих интерфейсов нет"
+exit 0

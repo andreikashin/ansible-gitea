@@ -1,40 +1,81 @@
 # {{ ansible_managed }}
 #
-# Доставка наружу пока не настроена сознательно: алерты смотрим в уголке
-# лаб-дашборда, который читает /api/v2/alerts отсюда. Alertmanager всё равно
-# нужен и стоит в цепочке с самого начала, потому что он даёт три вещи, которых
-# нет у голого Prometheus: дедупликацию, подавление каскадов и silences.
+# Alertmanager стоит в цепочке с самого начала не ради доставки, а ради трёх
+# вещей, которых нет у голого Prometheus: дедупликации, подавления каскадов и
+# silences.
 #
 # Silence понадобится буквально на следующей замене диска: массив уйдёт в
 # rebuild и покраснеет всё разом. Заглушить на два часа приятнее, чем смотреть.
 #
-# Когда захочется Telegram, правится только этот файл, UI не трогается:
-#   receivers:
-#     - name: lab-telegram
-#       telegram_configs:
-#         - bot_token: ...
-#           chat_id: ...
-#           parse_mode: HTML
+{% if lab_telegram_bot_token is defined and lab_telegram_chat_id is defined %}
+# Доставка в Telegram включена. Бот переиспользуется тот же, что у продуктового
+# бота: заводить второго ради одного оператора незачем. Чат при этом личный, а
+# не групповой канал выгрузок, чтобы алерты не тонули среди данных.
+#
+# Плата за общий токен: компрометация машины с продуктовым ботом даёт заодно
+# возможность слать поддельные алерты. Для домашней лабы приемлемо, а если
+# разделять, менять надо ровно две переменные в host_vars.
+{% else %}
+# Доставка наружу не настроена: алерты видны только в уголке лаб-дашборда,
+# который читает /api/v2/alerts отсюда. Чтобы включить Telegram, задай
+# lab_telegram_bot_token и lab_telegram_chat_id в host_vars.
+{% endif %}
 
 global:
   resolve_timeout: 5m
 
 route:
-  receiver: lab-null
+  receiver: {{ 'lab-telegram' if lab_telegram_bot_token is defined else 'lab-null' }}
   group_by: ['alertname', 'node']
   group_wait: 30s
   group_interval: 5m
-  # Сутки, а не часы: пока алерты живут только в UI, повторять их незачем,
-  # они и так видны. При появлении Telegram уменьшить.
+{% if lab_telegram_bot_token is defined %}
+  # Двенадцать часов вместо суток: висящий алерт должен напоминать о себе, но не
+  # долбить. Сутки стояли, пока доставки не было вовсе.
+  repeat_interval: 12h
+{% else %}
+  # Сутки: пока алерты живут только в UI, повторять их незачем, они и так видны.
   repeat_interval: 24h
+{% endif %}
 
   routes:
+{% if lab_telegram_bot_token is defined %}
+    # В мессенджер уходит ТОЛЬКО critical. Если слать всё, через месяц чат
+    # замьютят, и канал доставки перестанет существовать. Warning остаётся в
+    # уголке дашборда и в Grafana, там он и нужен.
+    - matchers: ['severity = "critical"']
+      receiver: lab-telegram
+      group_wait: 10s
+      repeat_interval: 4h
+
+    - matchers: ['severity =~ "warning|info"']
+      receiver: lab-null
+{% else %}
     - matchers: ['severity = "critical"']
       receiver: lab-null
       group_wait: 10s
+{% endif %}
 
 receivers:
   - name: lab-null
+
+{% if lab_telegram_bot_token is defined and lab_telegram_chat_id is defined %}
+  - name: lab-telegram
+    telegram_configs:
+      - bot_token: '{{ lab_telegram_bot_token }}'
+        chat_id: {{ lab_telegram_chat_id }}
+        parse_mode: HTML
+        # Гасшее тоже сообщаем: иначе непонятно, само починилось или ещё горит.
+        send_resolved: true
+        # Первая строка несёт то, что читается с экрана блокировки: что сгорело
+        # и на какой ноде. Подробности ниже, для того, кто откроет.
+        message: |-
+          {% raw %}{{ if eq .Status "firing" }}🔴{{ else }}✅{{ end }} <b>{{ .CommonLabels.alertname }}</b>{{ if .CommonLabels.node }} на {{ .CommonLabels.node }}{{ end }}
+          {{ range .Alerts }}
+          {{ .Annotations.summary }}{{ if .Annotations.description }}
+          <i>{{ .Annotations.description }}</i>{{ end }}
+          {{ end }}{% endraw %}
+{% endif %}
 
 # Подавление каскадов. Без этого недоступная нода выдаст восемь алертов про
 # свои диски, десять про гестов и один про сборщик, а полезен из них ровно один.

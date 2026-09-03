@@ -1,0 +1,14 @@
+[Unit]
+Description=Выключить разгрузку на сетевых картах, портящих данные
+Documentation=file:/usr/local/sbin/lab-nic-offload
+# После поднятия сети: до неё интерфейсов может ещё не быть.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=true
+ExecStart=/usr/local/sbin/lab-nic-offload
+
+[Install]
+WantedBy=multi-user.target

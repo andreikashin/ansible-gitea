@@ -1,0 +1,64 @@
+---
+# Настройки ethtool живут до перезагрузки. Поэтому не команда, а сервис:
+# иначе первый же ребут вернёт порчу данных, и искать её будут заново.
+
+- name: Install the offload script
+  copy:
+    src: lab-nic-offload
+    dest: /usr/local/sbin/lab-nic-offload
+    owner: root
+    group: root
+    mode: '0755'
+
+- name: Install the systemd unit
+  copy:
+    src: lab-nic-offload.service
+    dest: /etc/systemd/system/lab-nic-offload.service
+    owner: root
+    group: root
+    mode: '0644'
+  register: pve_nic_offload_unit
+
+- name: Reload systemd
+  systemd:
+    daemon_reload: true
+  when: pve_nic_offload_unit.changed
+
+- name: Enable and run it now
+  systemd:
+    name: lab-nic-offload.service
+    enabled: true
+    state: restarted
+
+- name: Read back the offload state
+  shell: |
+    set -o pipefail
+    for d in /sys/class/net/*; do
+      i=$(basename "$d")
+      case "$i" in lo|vmbr*|tap*|fw*|veth*|bond*) continue ;; esac
+      [ -e "$d/device" ] || continue
+      drv=$(ethtool -i "$i" 2>/dev/null | awk '/^driver:/{print $2}')
+      tso=$(ethtool -k "$i" 2>/dev/null | awk '/^tcp-segmentation-offload:/{print $2}')
+      echo "$i $drv $tso"
+    done
+  args:
+    executable: /bin/bash
+  register: pve_nic_offload_state
+  changed_when: false
+
+# Проверяем именно результат, а не факт запуска сервиса: сервис мог отработать
+# и ничего не найти, и это выглядело бы как успех.
+- name: Verify no affected driver is left with segmentation offload on
+  assert:
+    that: >-
+      pve_nic_offload_state.stdout_lines
+      | select('search', '\\s(' ~ (pve_nic_offload_drivers | join('|')) ~ ')\\son$')
+      | list | length == 0
+    fail_msg: >-
+      На {{ inventory_hostname }} остались интерфейсы с включённой разгрузкой:
+      {{ pve_nic_offload_state.stdout_lines | join('; ') }}
+    quiet: true
+
+- name: Report
+  debug:
+    msg: "{{ inventory_hostname }}: {{ pve_nic_offload_state.stdout_lines | join('; ') }}"
