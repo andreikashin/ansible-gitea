@@ -1,0 +1,135 @@
+---
+# Создание геста под NetBox из cloud-образа Debian.
+#
+# Из образа, а не клонированием шаблона, по той же причине, что и в
+# create_pbs.yml: гест должен подниматься на ЛЮБОЙ ноде. Обкатка идёт на pve2,
+# а постоянное место другое, и переезд не должен упираться в то, есть ли на
+# целевой ноде своя библиотека шаблонов.
+#
+# Отдельного диска под данные нет сознательно: состояние NetBox целиком лежит
+# в PostgreSQL на дата-тире, локально остаются только образы и загруженные
+# картинки. Переезд геста данные не двигает.
+#
+#   ansible-playbook -i inventory.ini create_netbox.yml
+#   ansible-playbook -i inventory.ini create_netbox.yml -e netbox_pve_target=pve1
+
+- name: Provision the NetBox guest on Proxmox
+  hosts: "{{ netbox_pve_target | default('pve2') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    nb: "{{ hostvars[groups['netbox_group'] | first] }}"
+    nb_vmid: "{{ nb.netbox_vmid }}"
+    nb_name: "{{ nb.netbox_vm_name }}"
+    nb_ip: "{{ nb.ansible_host }}"
+    nb_image_path: "/var/lib/vz/template/{{ nb.netbox_image_url | basename }}"
+
+  tasks:
+    - name: Fetch the Debian cloud image
+      get_url:
+        url: "{{ nb.netbox_image_url }}"
+        dest: "{{ nb_image_path }}"
+        mode: '0644'
+
+    - name: Check whether the VMID is already taken
+      command: "qm config {{ nb_vmid }}"
+      register: nb_existing
+      changed_when: false
+      failed_when: false
+
+    # Занятый VMID не трогаем: на том конце может оказаться работающий сервис.
+    - name: Create the virtual machine
+      command:
+        argv:
+          - qm
+          - create
+          - "{{ nb_vmid }}"
+          - --name
+          - "{{ nb_name }}"
+          - --memory
+          - "{{ nb.netbox_memory }}"
+          - --cores
+          - "{{ nb.netbox_cores }}"
+          - --sockets
+          - "1"
+          - --net0
+          - "virtio,bridge=vmbr0"
+          - --scsihw
+          - virtio-scsi-single
+          - --ostype
+          - l26
+          - --agent
+          - "1"
+          - --onboot
+          - "1"
+          - --description
+          - "NetBox. Source of truth for racks, addresses and VLANs."
+      when: nb_existing.rc != 0
+      # i440fx, а не q35: под q35 cloud-init CD не читается, и гест поднимается
+      # без сети с hostname localhost. Проверено на этом стенде.
+
+    - name: Import the cloud image as the system disk
+      command: >-
+        qm set {{ nb_vmid }}
+        --scsi0 {{ nb.netbox_storage }}:0,import-from={{ nb_image_path }},discard=on
+      when: nb_existing.rc != 0
+
+    - name: Grow the system disk
+      command: "qm disk resize {{ nb_vmid }} scsi0 {{ nb.netbox_system_disk }}"
+      when: nb_existing.rc != 0
+
+    - name: Attach cloud-init and set the boot order
+      command: >-
+        qm set {{ nb_vmid }}
+        --ide2 {{ nb.netbox_storage }}:cloudinit --boot order=scsi0
+      when: nb_existing.rc != 0
+
+    - name: Write the public key for cloud-init
+      copy:
+        content: "{{ nb.netbox_pubkey }}\n"
+        dest: "/root/netbox-{{ nb_vmid }}.pub"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Apply user, key and static addressing
+      command:
+        argv:
+          - qm
+          - set
+          - "{{ nb_vmid }}"
+          - --ciuser
+          - "{{ nb.ansible_user }}"
+          - --sshkeys
+          - "/root/netbox-{{ nb_vmid }}.pub"
+          - --ipconfig0
+          - "ip={{ nb_ip }}/{{ nb.netbox_cidr }},gw={{ nb.netbox_gateway }}"
+          - --nameserver
+          - "{{ nb.netbox_nameserver }}"
+          - --searchdomain
+          - "{{ nb.netbox_searchdomain }}"
+
+    - name: Start the guest
+      command: "qm start {{ nb_vmid }}"
+      register: nb_start
+      changed_when: "'already running' not in (nb_start.stderr | default(''))"
+      failed_when:
+        - nb_start.rc != 0
+        - "'already running' not in (nb_start.stderr | default(''))"
+
+    - name: Wait until SSH answers
+      wait_for:
+        host: "{{ nb_ip }}"
+        port: 22
+        timeout: 300
+        delay: 10
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      debug:
+        msg: >-
+          Гест {{ nb_vmid }} {{ nb_name }} на {{ inventory_hostname }},
+          адрес {{ nb_ip }}. Дальше:
+          ansible-playbook -i inventory.ini deploy_netbox.yml

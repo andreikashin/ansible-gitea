@@ -1,0 +1,50 @@
+ansible_host: 192.168.1.10
+ansible_user: user
+ansible_ssh_private_key_file: ~/.ssh/id_rsa
+
+# The Proxmox node the guest is created on. Changing this line and re-running
+# both playbooks is how NetBox moves to another machine. Nothing else has to
+# change: the state lives in PostgreSQL on the data tier, not in the guest.
+netbox_pve_target: pve2
+
+# VMID follows the lab convention: 10000 plus the last octet of the address.
+netbox_vmid: 10010
+netbox_vm_name: netbox
+netbox_cidr: 24
+netbox_gateway: 192.168.1.1
+netbox_nameserver: 192.168.1.1
+netbox_searchdomain: example.lan
+
+# NetBox is a Django application with a few worker processes. It is not
+# CPU-bound; the heavy part is PostgreSQL, and that runs elsewhere.
+netbox_cores: 2
+netbox_memory: 4096
+
+# System disk only. Application state is in the external database; what stays
+# here is container images plus uploaded images and reports.
+netbox_system_disk: 20G
+netbox_storage: local-lvm
+
+netbox_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+netbox_pubkey: "ssh-ed25519 AAAA... your-key"
+
+# Database on the data tier. The role creates the role and the database; the
+# password below is the single source of truth and is re-applied on every run.
+netbox_db_name: netbox
+netbox_db_user: netbox
+netbox_db_password: "generate-me"
+
+# Signs sessions and API tokens. Changing it logs everyone out; it does not
+# touch stored data. At least 50 characters.
+netbox_secret_key: "generate-me"
+
+netbox_redis_password: "generate-me"
+
+netbox_superuser: admin
+netbox_superuser_email: admin@example.lan
+netbox_superuser_password: "generate-me"
+
+# Pepper for API tokens. From 4.6 on, NetBox stores tokens hashed and refuses to
+# accept them without this, answering "Invalid v1 token". Changing it
+# invalidates every token already issued.
+netbox_api_token_pepper: "generate-me"

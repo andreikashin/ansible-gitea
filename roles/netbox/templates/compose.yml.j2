@@ -1,0 +1,105 @@
+# {{ ansible_managed }}
+#
+# NetBox четырьмя контейнерами: веб, воркер очереди, уборщик и два Redis.
+# PostgreSQL внешний, на дата-тире, поэтому его здесь нет.
+#
+# Воркер и уборщик это не украшение: без воркера не работают отчёты, скрипты и
+# вебхуки, а без уборщика бесконечно растут журнал изменений и таблица сессий.
+
+services:
+  netbox:
+    image: {{ netbox_image }}
+    container_name: netbox
+    restart: unless-stopped
+    depends_on:
+      redis-tasks:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+    env_file: netbox.env
+    ports:
+      - "{{ netbox_port }}:8080"
+    volumes:
+      - netbox-media:/opt/netbox/netbox/media
+      - netbox-reports:/opt/netbox/netbox/reports
+      - netbox-scripts:/opt/netbox/netbox/scripts
+    # start_period большой намеренно. На пустой базе NetBox прогоняет несколько
+    # сотен миграций схемы, и на двух ядрах против внешнего PostgreSQL по
+    # стомегабитной сети это десятки минут. Со стандартными тремя минутами
+    # compose объявляет контейнер больным прямо посреди миграций и отказывается
+    # поднимать воркер с уборщиком, хотя всё идёт нормально.
+    # На последующих запусках миграций нет, и контейнер здоровеет за секунды.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/login/"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: {{ netbox_health_start_period }}
+
+  # Воркер берёт из очереди отчёты, скрипты и отправку вебхуков. Образ тот же,
+  # разница только в команде: иначе версии кода разъедутся между веб и очередью.
+  netbox-worker:
+    image: {{ netbox_image }}
+    container_name: netbox-worker
+    restart: unless-stopped
+    depends_on:
+      netbox:
+        condition: service_healthy
+    env_file: netbox.env
+    command:
+      - /opt/netbox/venv/bin/python
+      - /opt/netbox/netbox/manage.py
+      - rqworker
+
+  # Уборка это разовая команда Django, а не демон, поэтому крутим её в цикле.
+  # В образе нет housekeeping.sh, который встречается в старых примерах
+  # netbox-docker: контейнер с ним падает с кодом 127 и уходит в перезапуск.
+  netbox-housekeeping:
+    image: {{ netbox_image }}
+    container_name: netbox-housekeeping
+    restart: unless-stopped
+    depends_on:
+      netbox:
+        condition: service_healthy
+    env_file: netbox.env
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >-
+        while true; do
+        /opt/netbox/venv/bin/python /opt/netbox/netbox/manage.py housekeeping;
+        sleep {{ netbox_housekeeping_interval }};
+        done
+
+  # Два Redis, а не один: очередь задач обязана переживать перезапуск, а кэш
+  # наоборот выгодно терять. Смешать их значит либо потерять задания при
+  # вытеснении по памяти, либо хранить кэш вечно.
+  redis-tasks:
+    image: {{ netbox_redis_image }}
+    container_name: netbox-redis-tasks
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass '{{ netbox_redis_password }}'
+    volumes:
+      - netbox-redis-tasks:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "{{ netbox_redis_password }}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  redis-cache:
+    image: {{ netbox_redis_image }}
+    container_name: netbox-redis-cache
+    restart: unless-stopped
+    command: redis-server --save '' --appendonly no --requirepass '{{ netbox_redis_password }}'
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "{{ netbox_redis_password }}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  netbox-media:
+  netbox-reports:
+  netbox-scripts:
+  netbox-redis-tasks:

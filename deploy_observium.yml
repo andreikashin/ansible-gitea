@@ -1,0 +1,65 @@
+---
+# Разворачивает Observium в гест, созданный create_observium.yml.
+#
+# Охват сознательно узкий: **только сетевое железо**, свитч и роутер. Хосты и
+# гесты остаются за Prometheus и lab-metrics. Причина не в экономии, а в том,
+# что две системы, независимо алертящие об одном и том же, дают двойной шум в
+# один и тот же телеграм, а разбираться, какая из них права, придётся руками.
+#
+# Что Observium умеет такого, чего нет у Prometheus: он вычитывает у свитча
+# CDP и LLDP и сам рисует, кто на каком порту, показывает скорость и дуплекс по
+# каждому порту, счётчики ошибок и состав LACP-бандлов. Именно это нужно, чтобы
+# закрыть вопрос про 100 Мбит и потом проверить, что бонды реально размазывают
+# трафик по всем линкам, а не по одному.
+#
+# ⚠️ Устройства заводятся только если на них уже включён SNMP. Пока свитч не
+# настроен, список в host_vars может быть пустым: плейбук от этого не падает.
+#
+#   ansible-playbook -i inventory.ini create_observium.yml   # один раз
+#   ansible-playbook -i inventory.ini deploy_observium.yml
+
+- name: Deploy Observium
+  hosts: observium_group
+  become: true
+
+  pre_tasks:
+    # На свежесозданном госте cloud-init ещё доделывает своё, в том числе держит
+    # apt. Без этой задачи первый прогон падает на "no package matching
+    # qemu-guest-agent is available": список пакетов в этот момент пуст, потому
+    # что apt update внутри cloud-init ещё не закончился. Проверено на этом
+    # стенде.
+    - name: Wait until cloud-init has finished
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      apt:
+        name:
+          - qemu-guest-agent
+          - curl
+          - ca-certificates
+        state: present
+
+    - name: Ensure the guest agent is running
+      systemd:
+        name: qemu-guest-agent
+        state: started
+        enabled: true
+
+  roles:
+    - observium
+
+  post_tasks:
+    - name: Where to look
+      debug:
+        msg:
+          - "Observium: http://{{ ansible_host }}/"
+          - "Вход:      {{ observium_admin_user }}, пароль в host_vars/observium_node.yml"
+          - "Порты устройства: Devices, выбрать железку, вкладка Ports"
+          - "Скорость и дуплекс по каждому порту там же, столбцы Speed и Duplex"

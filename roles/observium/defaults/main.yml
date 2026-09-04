@@ -1,0 +1,29 @@
+---
+observium_install_dir: /opt/observium
+observium_rrd_dir: /opt/observium/rrd
+
+# Community Edition раздаётся тарболлом, репозитория для неё нет. Ссылка всегда
+# указывает на последний выпуск, версии в имени файла не бывает.
+observium_tarball_url: https://www.observium.org/observium-community-latest.tar.gz
+
+observium_db_name: observium
+observium_db_user: observium
+
+observium_admin_user: admin
+# 10 это уровень прав администратора в Observium.
+observium_admin_level: 10
+
+observium_port: 80
+
+# Устройства, которые опрашиваются по SNMP. Пусто по умолчанию: наполняется в
+# host_vars, чтобы список железа не лежал в роли.
+#
+# Охват сознательно узкий, только сетевое железо. Хосты остаются за Prometheus:
+# две системы, независимо алертящие об одном и том же, дают двойной шум в один
+# и тот же телеграм.
+observium_devices: []
+
+# Опрос и обнаружение. Штатные интервалы Observium: опрос раз в пять минут,
+# обнаружение раз в шесть часов.
+observium_poller_workers: 4
+observium_discovery_workers: 4

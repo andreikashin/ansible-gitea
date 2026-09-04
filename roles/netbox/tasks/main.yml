@@ -1,0 +1,131 @@
+---
+# Разворачивает NetBox в госте. База к этому моменту уже создана отдельным play
+# на дата-тире, см. tasks/database.yml.
+
+- name: Create the install directory
+  file:
+    path: "{{ netbox_install_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+# 0600: внутри пароль базы, ключ подписи сессий, пароль администратора и
+# токен API. Каталог 0750, чтобы файл не читался и через листинг.
+- name: Generate the environment file
+  template:
+    src: netbox.env.j2
+    dest: "{{ netbox_install_dir }}/netbox.env"
+    owner: root
+    group: root
+    mode: '0600'
+  no_log: true
+  notify: Restart NetBox
+
+- name: Generate the compose file
+  template:
+    src: compose.yml.j2
+    dest: "{{ netbox_install_dir }}/compose.yml"
+    owner: root
+    group: root
+    mode: '0640'
+  notify: Restart NetBox
+
+# Готовность не ждём здесь: параметр wait появился в community.docker позже
+# той версии, что стоит на управляющей машине, а ждать всё равно надо не
+# запуска контейнера, а ответа приложения. Этим занимается следующая задача.
+#
+# Задача помечается changed на каждом прогоне, даже когда ничего не менялось:
+# модуль считает изменением любой вывод compose. Проверено, что контейнеры при
+# этом не пересоздаются и аптайм не сбрасывается. Глушить не стал: заткнуть
+# отчёт об изменении хуже, чем косметически лишний changed.
+- name: Pull images and start the stack
+  community.docker.docker_compose_v2:
+    project_src: "{{ netbox_install_dir }}"
+    project_name: "{{ netbox_compose_project }}"
+    pull: missing
+    state: present
+  register: netbox_stack
+
+# Первый запуск это миграции схемы на пустой базе, они идут минутами. Ждём по
+# работающему логину, а не по открытому порту: порт слушает gunicorn ещё до
+# того, как приложение готово отвечать.
+- name: Wait until NetBox answers
+  uri:
+    url: "http://127.0.0.1:{{ netbox_port }}/login/"
+    status_code: 200
+    validate_certs: false
+  register: netbox_ready
+  retries: 60
+  delay: 10
+  until: netbox_ready.status == 200
+
+- name: Read the version
+  command: docker exec netbox cat /opt/netbox/VERSION
+  register: netbox_version
+  changed_when: false
+
+# Токен API нужен плейбукам, которые будут заливать сюда карту портов.
+#
+# Задать его заранее из инвентаря нельзя: с версии 4.6 NetBox хранит токены
+# хешированными с солью и открытое значение показывает ровно один раз, в момент
+# создания. Поэтому токен создаётся здесь и кладётся в файл на самом госте,
+# откуда его заберут следующие плейбуки. В репозиторий он не попадает вовсе,
+# что лучше, чем секрет в инвентаре.
+- name: Ensure an API token exists for the superuser
+  command:
+    argv:
+      - docker
+      - exec
+      - netbox
+      - /opt/netbox/venv/bin/python
+      - /opt/netbox/netbox/manage.py
+      - shell
+      - -c
+      # Токен второго поколения предъявляется одной строкой вида
+      #
+      #     nbt_<key>.<секрет>
+      #
+      # и передаётся схемой Bearer, а не Token. Ни key, ни секрет по отдельности
+      # не работают: по префиксу NetBox определяет поколение токена, по key ищет
+      # запись, секретом проверяет hmac. Отдать что-то одно значит получать
+      # "Invalid v1 token" на каждый запрос.
+      #
+      # Секрет живёт только в памяти в момент создания: в базе лежит лишь
+      # hmac_digest, и после перечитывания объекта секрет уже не восстановить.
+      # Поэтому собираем полную строку прямо здесь.
+      - |
+        import warnings; warnings.filterwarnings("ignore")
+        from users.constants import TOKEN_PREFIX
+        from users.models import Token, User
+        u = User.objects.get(username="{{ netbox_superuser }}")
+        t = Token.objects.filter(user=u).first()
+        if t:
+            print("EXISTS")
+        else:
+            t = Token(user=u, write_enabled=True, description="ansible")
+            t.save()
+            print("CREATED", f"{TOKEN_PREFIX}{t.key}.{t.token}")
+  register: netbox_token_out
+  changed_when: "'CREATED' in netbox_token_out.stdout"
+
+- name: Store a freshly created token on the guest
+  copy:
+    content: "{{ netbox_token_out.stdout_lines | select('search', '^CREATED') | first | regex_replace('^CREATED ', '') }}\n"
+    dest: "{{ netbox_install_dir }}/api-token"
+    owner: root
+    group: root
+    mode: '0600'
+  when: "'CREATED' in netbox_token_out.stdout"
+  no_log: true
+
+- name: Report
+  debug:
+    msg:
+      - "NetBox {{ netbox_version.stdout | trim }} поднят, база на {{ netbox_db_host }}."
+      - "Интерфейс: http://{{ ansible_host }}:{{ netbox_port }}/"
+      - >-
+        Токен API: {{ 'создан, лежит в ' + netbox_install_dir + '/api-token на госте'
+                      if 'CREATED' in netbox_token_out.stdout
+                      else 'уже был, файл не трогали' }}
+      - "Предъявлять схемой Bearer, а не Token: это токен второго поколения."

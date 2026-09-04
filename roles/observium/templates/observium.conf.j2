@@ -1,0 +1,22 @@
+# {{ ansible_managed }}
+#
+# Виртуальный хост Observium. Слушает только внутренний адрес лабы: наружу
+# ничего не публикуется, доступ через Traefik при необходимости добавляется
+# отдельно.
+
+<VirtualHost *:{{ observium_port }}>
+    DocumentRoot {{ observium_install_dir }}/html
+    ServerName {{ observium_vm_name }}.{{ observium_searchdomain }}
+    ServerAlias {{ ansible_host }}
+
+    <Directory {{ observium_install_dir }}/html/>
+        Options FollowSymLinks MultiViews
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    # Скрипты Observium пишут в журнал сами, поэтому здесь только доступ и
+    # ошибки самого веб-сервера.
+    ErrorLog  ${APACHE_LOG_DIR}/observium-error.log
+    CustomLog ${APACHE_LOG_DIR}/observium-access.log combined
+</VirtualHost>

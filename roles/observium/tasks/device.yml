@@ -1,0 +1,37 @@
+---
+# Заведение одного устройства. Вынесено в отдельный файл, потому что проверка
+# на существование и добавление это две задачи, а loop поверх include_tasks
+# читается лучше, чем два loop с when по индексу.
+#
+# add_device.php на уже заведённом устройстве возвращает ошибку, поэтому
+# сначала смотрим в базу.
+
+- name: "Check whether {{ device.hostname }} is already known"
+  command: >-
+    mysql -N -B {{ observium_db_name }}
+    -e "select count(*) from devices where hostname = '{{ device.hostname }}'"
+  register: obs_device_check
+  changed_when: false
+
+- name: "Add {{ device.hostname }}"
+  command:
+    argv:
+      - "{{ observium_install_dir }}/add_device.php"
+      - "{{ device.hostname }}"
+      - "{{ device.community }}"
+      - "{{ device.version | default('v2c') }}"
+  when: obs_device_check.stdout | trim == '0'
+  register: obs_device_add
+  # Устройство может быть недоступно по SNMP в момент прогона: свитч ещё не
+  # настроен, роутер в перезагрузке. Это не повод валить весь плейбук, но и
+  # молчать нельзя, поэтому результат печатается ниже.
+  failed_when: false
+  no_log: true
+
+- name: "Result for {{ device.hostname }}"
+  debug:
+    msg: >-
+      {{ device.hostname }}:
+      {{ 'уже заведено' if obs_device_check.stdout | trim != '0'
+         else ('добавлено' if obs_device_add.rc == 0
+               else 'НЕ добавлено, SNMP не ответил или community не подошёл') }}

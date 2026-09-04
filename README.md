@@ -246,3 +246,66 @@ object can be written, read back byte for byte, and deleted.
 `backup_proxmox_vms.yml` backs up Proxmox guests (both QEMU VMs and LXC CTs) via
 `vzdump`, copies the archives to the control node, and removes the remote copy
 on success. Target a subset with `-e proxmox_backup_vm_ids=[100,101]`.
+
+## Source of truth and network monitoring
+
+Two services that belong together: NetBox records what the network *should* be,
+Observium measures what it *is*.
+
+### NetBox
+
+`create_netbox.yml` builds the guest from a Debian cloud image;
+`deploy_netbox.yml` creates the database on the data tier and brings up the
+stack.
+
+```bash
+cp host_vars/_netbox_node.yml.template host_vars/netbox_node.yml   # fill in, gitignored
+# add the host to [netbox_group] in inventory.ini
+
+ansible-playbook -i inventory.ini create_netbox.yml
+ansible-playbook -i inventory.ini deploy_netbox.yml
+```
+
+PostgreSQL is **external**, on the data tier: that is where the state lives and
+where backups already run. The playbook creates the role and the database
+itself, and re-applies the password on every run so the inventory stays the
+single source of truth.
+
+Redis is **local** to the guest, and there are two of them. The task queue has
+to survive a restart; the cache is better off lost. Sharing one instance means
+either losing jobs to memory eviction or keeping cache entries forever.
+
+Moving NetBox to another node is one line in `host_vars` plus a rerun of both
+playbooks. No data moves, because none of it is in the guest.
+
+### Observium
+
+`create_observium.yml` builds the guest, `deploy_observium.yml` installs
+Observium Community Edition natively.
+
+```bash
+cp host_vars/_observium_node.yml.template host_vars/observium_node.yml
+# add the host to [observium_group] in inventory.ini
+
+ansible-playbook -i inventory.ini create_observium.yml
+ansible-playbook -i inventory.ini deploy_observium.yml
+```
+
+Three deliberate departures from how everything else in this repo is built:
+
+- **Debian 12, not 13.** Community Edition ships twice a year and trails Debian
+  on PHP support. Trixie brings PHP 8.4 and CE breaks on it; bookworm gives 8.2.
+- **Native install, not Docker.** Observium publishes no official image, and a
+  third-party one would put the monitoring system at the mercy of someone else's
+  release schedule.
+- **MariaDB local to the guest.** The time series live in RRD files on disk; the
+  database holds derived state that is rebuilt by re-polling. No reason to add a
+  third engine to the tier that matters.
+
+Scope is **network gear only**: the switch, the router, and anything else that
+speaks SNMP and is not a host. Hosts stay with Prometheus and `lab-metrics`.
+Two systems alerting independently about the same thing produce double the noise
+in the same Telegram chat and an argument about which one is right.
+
+`observium_devices` is empty until SNMP is enabled on the devices. Adding a
+device that does not answer just records it as down.

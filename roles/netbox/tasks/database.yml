@@ -1,0 +1,82 @@
+---
+# Роль и база под NetBox на дата-тире. Запускается ОТДЕЛЬНЫМ play на хосте базы,
+# а не из геста: лезть в чужой PostgreSQL по сети с правами суперпользователя
+# ради двух DDL незачем, а локально это docker exec.
+#
+# Идемпотентность через проверку каталога, а не через ON CONFLICT: CREATE ROLE и
+# CREATE DATABASE такого синтаксиса не имеют, а CREATE DATABASE вдобавок не
+# выполняется внутри транзакции, поэтому DO-блоком её не обернуть.
+
+- name: Check whether the NetBox role exists
+  command: >-
+    docker exec {{ netbox_db_container }}
+    psql -U {{ netbox_db_superuser }} -d postgres -Atc
+    "select 1 from pg_roles where rolname = '{{ netbox_db_user }}'"
+  register: netbox_role_check
+  changed_when: false
+
+- name: Create the NetBox role
+  command:
+    argv:
+      - docker
+      - exec
+      - "{{ netbox_db_container }}"
+      - psql
+      - -U
+      - "{{ netbox_db_superuser }}"
+      - -d
+      - postgres
+      - -c
+      - "create role {{ netbox_db_user }} login password '{{ netbox_db_password }}'"
+  when: netbox_role_check.stdout | trim != '1'
+  no_log: true
+
+# Пароль на существующей роли выравниваем всегда: иначе смена пароля в
+# host_vars молча разъезжается с тем, что стоит в базе, и NetBox падает на
+# подключении через месяц, когда причина уже забыта.
+- name: Align the role password with the inventory
+  command:
+    argv:
+      - docker
+      - exec
+      - "{{ netbox_db_container }}"
+      - psql
+      - -U
+      - "{{ netbox_db_superuser }}"
+      - -d
+      - postgres
+      - -c
+      - "alter role {{ netbox_db_user }} with login password '{{ netbox_db_password }}'"
+  when: netbox_role_check.stdout | trim == '1'
+  changed_when: false
+  no_log: true
+
+- name: Check whether the NetBox database exists
+  command: >-
+    docker exec {{ netbox_db_container }}
+    psql -U {{ netbox_db_superuser }} -d postgres -Atc
+    "select 1 from pg_database where datname = '{{ netbox_db_name }}'"
+  register: netbox_db_check
+  changed_when: false
+
+- name: Create the NetBox database
+  command: >-
+    docker exec {{ netbox_db_container }}
+    psql -U {{ netbox_db_superuser }} -d postgres -c
+    "create database {{ netbox_db_name }} owner {{ netbox_db_user }} encoding 'UTF8'"
+  when: netbox_db_check.stdout | trim != '1'
+
+# NetBox сам создаёт таблицы миграциями, но для этого ему нужны права на схему
+# public. В PostgreSQL 15 и новее владелец базы их по умолчанию не получает.
+- name: Grant schema rights to the NetBox role
+  command: >-
+    docker exec {{ netbox_db_container }}
+    psql -U {{ netbox_db_superuser }} -d {{ netbox_db_name }} -c
+    "grant all on schema public to {{ netbox_db_user }}"
+  changed_when: false
+
+- name: Report
+  debug:
+    msg: >-
+      База {{ netbox_db_name }} на {{ inventory_hostname }} готова,
+      владелец {{ netbox_db_user }}.

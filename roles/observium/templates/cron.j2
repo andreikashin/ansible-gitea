@@ -1,0 +1,26 @@
+# {{ ansible_managed }}
+#
+# Штатное расписание Observium. Всё запускается от root: скриптам нужен доступ
+# к rrd-файлам и к сырым сокетам для fping.
+#
+# Точка входа это observium-wrapper, а не poller.php напрямую: обёртка держит
+# очередь и раскидывает устройства по воркерам, иначе опрос идёт последовательно
+# и на десятке устройств уже не укладывается в пятиминутный шаг.
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+
+# Полное обнаружение раз в шесть часов: порты, соседи по CDP и LLDP, стеки.
+33  */6  * * *   root  {{ observium_install_dir }}/observium-wrapper discovery >> /dev/null 2>&1
+
+# Добор только что заведённых устройств, чтобы не ждать шесть часов до первых
+# графиков.
+*/5  *   * * *   root  {{ observium_install_dir }}/observium-wrapper discovery --host new >> /dev/null 2>&1
+
+# Опрос счётчиков. Пять минут это шаг, на который рассчитаны rrd-файлы: реже
+# означает дыры на графиках, чаще означает пустую нагрузку.
+*/5  *   * * *   root  {{ observium_install_dir }}/observium-wrapper poller >> /dev/null 2>&1
+
+# Уборка: старые записи журнала и осиротевшие rrd. Без неё каталог растёт
+# бесконечно, а на удалённой площадке это заметят не сразу.
+13   5   * * *   root  {{ observium_install_dir }}/housekeeping.php -ysel >> /dev/null 2>&1
+47   4   * * *   root  {{ observium_install_dir }}/housekeeping.php -yrptb >> /dev/null 2>&1

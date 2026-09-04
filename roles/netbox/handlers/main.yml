@@ -1,0 +1,6 @@
+---
+- name: Restart NetBox
+  community.docker.docker_compose_v2:
+    project_src: "{{ netbox_install_dir }}"
+    state: restarted
+  listen: Restart NetBox

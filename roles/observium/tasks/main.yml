@@ -1,0 +1,200 @@
+---
+# Observium Community Edition, установка нативно, без Docker.
+#
+# Официального образа у Observium нет, а сторонний тянуть в лабу ради экономии
+# двадцати строк не хочется: это мониторинг, он должен переживать чужие
+# решения о том, когда чинить образ. CE раздаётся тарболлом, и документированный
+# путь установки именно такой.
+
+- name: Install packages
+  apt:
+    name:
+      # Веб и PHP
+      - apache2
+      - libapache2-mod-php
+      - php-cli
+      - php-mysql
+      - php-gd
+      - php-mbstring
+      - php-snmp
+      - php-curl
+      - php-xml
+      - php-zip
+      # База
+      - mariadb-server
+      - mariadb-client
+      - python3-pymysql
+      # Опрос и графики
+      - rrdtool
+      - fping
+      - snmp
+      - snmpd
+      - graphviz
+      - imagemagick
+      - whois
+      - mtr-tiny
+      - ipmitool
+      - python3-mysqldb
+      - subversion
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Ensure MariaDB is running
+  systemd:
+    name: mariadb
+    state: started
+    enabled: true
+
+# Root в MariaDB на Debian ходит через unix_socket, пароля у него нет и не надо:
+# база слушает только localhost внутри геста, а вход по сокету требует уже быть
+# root на машине.
+- name: Check whether the Observium database exists
+  command: mysql -N -B -e "show databases like '{{ observium_db_name }}'"
+  register: obs_db_check
+  changed_when: false
+
+- name: Create the database
+  command: >-
+    mysql -e "create database {{ observium_db_name }}
+    character set utf8mb4 collate utf8mb4_unicode_ci"
+  when: observium_db_name not in obs_db_check.stdout
+
+# Пароль выравниваем на каждом прогоне: иначе правка в host_vars молча
+# расходится с тем, что стоит в базе.
+- name: Create or update the Observium database user
+  command:
+    argv:
+      - mysql
+      - -e
+      - >-
+        create user if not exists '{{ observium_db_user }}'@'localhost'
+        identified by '{{ observium_db_password }}';
+        alter user '{{ observium_db_user }}'@'localhost'
+        identified by '{{ observium_db_password }}';
+        grant all privileges on {{ observium_db_name }}.*
+        to '{{ observium_db_user }}'@'localhost';
+        flush privileges;
+  no_log: true
+  changed_when: false
+
+- name: Check whether Observium is already unpacked
+  stat:
+    path: "{{ observium_install_dir }}/discovery.php"
+  register: obs_installed
+
+- name: Download the Community Edition tarball
+  get_url:
+    url: "{{ observium_tarball_url }}"
+    dest: /tmp/observium-community-latest.tar.gz
+    mode: '0644'
+  when: not obs_installed.stat.exists
+
+# Тарболл разворачивается в каталог observium, поэтому распаковываем в /opt.
+- name: Unpack Observium
+  unarchive:
+    src: /tmp/observium-community-latest.tar.gz
+    dest: /opt
+    remote_src: true
+    creates: "{{ observium_install_dir }}/discovery.php"
+
+- name: Create the directory layout
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: '0755'
+  loop:
+    - "{{ observium_rrd_dir }}"
+    - "{{ observium_install_dir }}/logs"
+
+- name: Generate config.php
+  template:
+    src: config.php.j2
+    dest: "{{ observium_install_dir }}/config.php"
+    owner: root
+    group: www-data
+    mode: '0640'
+  no_log: true
+
+# Схема накатывается через discovery.php -u, и никак иначе. В руководствах по
+# Observium встречаются два устаревших пути: includes/sql-schema/update.php
+# (в CE 26.x такого файла нет вовсе) и includes/update/update.php (файл есть,
+# но при прямом вызове отказывается работать и сам указывает на discovery.php).
+# Проверено на версии 26.1.
+#
+# Применяются только недостающие обновления, поэтому гонять можно каждый раз.
+- name: Apply the database schema
+  command: ./discovery.php -u
+  args:
+    chdir: "{{ observium_install_dir }}"
+  register: obs_schema
+  changed_when: "'Updating database' in obs_schema.stdout or 'Schema update' in obs_schema.stdout"
+
+- name: Check whether the admin user exists
+  command: >-
+    mysql -N -B {{ observium_db_name }}
+    -e "select count(*) from users where username = '{{ observium_admin_user }}'"
+  register: obs_user_check
+  changed_when: false
+
+- name: Create the admin user
+  command:
+    argv:
+      - "{{ observium_install_dir }}/adduser.php"
+      - "{{ observium_admin_user }}"
+      - "{{ observium_admin_password }}"
+      - "{{ observium_admin_level }}"
+  when: obs_user_check.stdout | trim == '0'
+  no_log: true
+
+- name: Install the Apache virtual host
+  template:
+    src: observium.conf.j2
+    dest: /etc/apache2/sites-available/observium.conf
+    mode: '0644'
+  notify: Reload Apache
+
+- name: Disable the default site
+  command: a2dissite 000-default
+  args:
+    removes: /etc/apache2/sites-enabled/000-default.conf
+  notify: Reload Apache
+
+- name: Enable the Observium site and rewrite
+  command: "{{ item }}"
+  args:
+    creates: "/etc/apache2/sites-enabled/observium.conf"
+  loop:
+    - a2enmod rewrite
+    - a2ensite observium
+  notify: Reload Apache
+
+- name: Ensure Apache is running
+  systemd:
+    name: apache2
+    state: started
+    enabled: true
+
+- name: Install the cron schedule
+  template:
+    src: cron.j2
+    dest: /etc/cron.d/observium
+    owner: root
+    group: root
+    mode: '0644'
+
+- name: Add the monitored devices
+  include_tasks: device.yml
+  loop: "{{ observium_devices }}"
+  loop_control:
+    loop_var: device
+    label: "{{ device.hostname }}"
+
+- name: Report
+  debug:
+    msg:
+      - "Observium: http://{{ ansible_host }}/  вход {{ observium_admin_user }}"
+      - "Устройств заведено: {{ observium_devices | length }}"
+      - "Первый опрос произойдёт в ближайшие пять минут по cron."

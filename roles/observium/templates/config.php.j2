@@ -1,0 +1,40 @@
+<?php
+// {{ ansible_managed }}
+//
+// Права 0640, владелец www-data: здесь пароль базы. Файл читается и веб-мордой,
+// и скриптами опроса из cron.
+
+$config['db_host'] = 'localhost';
+$config['db_user'] = '{{ observium_db_user }}';
+$config['db_pass'] = '{{ observium_db_password }}';
+$config['db_name'] = '{{ observium_db_name }}';
+
+$config['base_url'] = 'http://{{ ansible_host }}:{{ observium_port }}';
+$config['rrd_dir']  = '{{ observium_rrd_dir }}';
+
+// Пути к утилитам. Observium ищет их сам, но на минимальном образе поиск
+// иногда промахивается, а молчаливо неработающий fping выглядит как "все
+// устройства недоступны".
+$config['fping']  = '/usr/bin/fping';
+$config['rrdtool'] = '/usr/bin/rrdtool';
+$config['snmpwalk'] = '/usr/bin/snmpwalk';
+$config['snmpget']  = '/usr/bin/snmpget';
+
+// Автообнаружение соседей через CDP и LLDP. Ради этого Observium здесь и стоит:
+// он сам вычитывает у свитча, кто на каком порту, и рисует связи.
+$config['autodiscovery']['xdp'] = true;
+// А вот заводить найденных соседей как новые устройства не даём: охват узкий,
+// только сетевое железо, и хосты не должны заезжать сюда сами.
+$config['autodiscovery']['ping'] = false;
+$config['autodiscovery']['snmpscan'] = false;
+
+// Своя рассылка выключена. Уведомления в лабе идут одним каналом через
+// Alertmanager, второй адресат означает второй источник шума.
+$config['email']['enable'] = false;
+$config['alerts']['email']['enable'] = false;
+
+// Не показывать в интерфейсе то, чего у нас нет.
+$config['enable_billing'] = false;
+$config['enable_syslog'] = false;
+
+$config['poller-wrapper']['alerter'] = true;

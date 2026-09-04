@@ -1,0 +1,119 @@
+---
+# Разворачивает NetBox в гест, созданный create_netbox.yml.
+#
+# Два play, и порядок обязателен: сначала база на дата-тире, потом приложение.
+# Первый запуск NetBox это миграции схемы, и без готовой базы он просто ляжет в
+# рестарт-петлю.
+#
+# Почему база внешняя, а Redis локальный. В PostgreSQL лежит всё состояние, это
+# то, что надо бэкапить, и оно должно ехать общим слоем вместе с остальными
+# приложениями. Redis у NetBox это очередь задач и кэш, то есть производные
+# данные: они восстанавливаются сами, бэкапа не требуют, а лишний сетевой хоп
+# на каждый запрос не нужен.
+#
+#   ansible-playbook -i inventory.ini create_netbox.yml   # один раз
+#   ansible-playbook -i inventory.ini deploy_netbox.yml
+
+- name: Create the NetBox database on the data tier
+  hosts: db_group
+  become: true
+  gather_facts: false
+
+  vars:
+    nb: "{{ hostvars[groups['netbox_group'] | first] }}"
+    netbox_db_container: "{{ pg_dump_container | default('db-postgres') }}"
+    netbox_db_superuser: postgres
+    netbox_db_name: "{{ nb.netbox_db_name | default('netbox') }}"
+    netbox_db_user: "{{ nb.netbox_db_user | default('netbox') }}"
+    netbox_db_password: "{{ nb.netbox_db_password }}"
+
+  tasks:
+    - name: Create the role and the database
+      include_role:
+        name: netbox
+        tasks_from: database
+
+- name: Deploy NetBox
+  hosts: netbox_group
+  become: true
+
+  vars:
+    netbox_db_host: "{{ hostvars[groups['db_group'] | first].ansible_host }}"
+    # NetBox отбивает запросы с чужим Host заголовком. Пускаем по адресу, по
+    # имени и по имени в домене лабы: иначе после заведения записи в DNS
+    # интерфейс отдаёт 400, а причина неочевидна.
+    netbox_allowed_hosts: "{{ ansible_host }} {{ inventory_hostname }} {{ netbox_vm_name }}.{{ netbox_searchdomain }} localhost 127.0.0.1"
+    netbox_search_domain: "{{ netbox_searchdomain }}"
+
+  pre_tasks:
+    # На свежесозданном госте cloud-init ещё доделывает своё и держит apt.
+    # Без ожидания первый прогон падает на том, что список пакетов пуст.
+    - name: Wait until cloud-init has finished
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      apt:
+        name:
+          - qemu-guest-agent
+          - curl
+          - ca-certificates
+          - python3-pip
+        state: present
+
+    # Системный python3-docker конфликтует с тем, что нужен docker_compose_v2.
+    # Тот же порядок, что в deploy_observability.yml и deploy_traefik.yml.
+    - name: Remove the distro python3-docker
+      apt:
+        name: python3-docker
+        state: absent
+
+    - name: Install the Docker SDK via pip
+      pip:
+        name:
+          - docker
+          - requests
+        state: present
+        extra_args: "--break-system-packages"
+
+    - name: Check whether Docker is present
+      command: docker --version
+      register: nb_docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download the Docker install script
+      get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: '0755'
+      when: nb_docker_check.rc != 0
+
+    - name: Install Docker
+      command: sh /tmp/get-docker.sh
+      when: nb_docker_check.rc != 0
+
+    - name: Ensure Docker is enabled and running
+      systemd:
+        name: docker
+        state: started
+        enabled: true
+
+  roles:
+    - netbox
+
+  post_tasks:
+    - name: Where to look
+      debug:
+        msg:
+          - "NetBox:  http://{{ ansible_host }}:{{ netbox_port }}/"
+          - "Вход:    {{ netbox_superuser }}, пароль в host_vars/netbox_node.yml"
+          - "API:     http://{{ ansible_host }}:{{ netbox_port }}/api/"
+          - "Токен:   {{ netbox_install_dir }}/api-token на самом госте, права 0600"
+          - "Метрики: http://{{ ansible_host }}:{{ netbox_port }}/metrics"

@@ -1,0 +1,43 @@
+ansible_host: 192.168.1.11
+ansible_user: user
+ansible_ssh_private_key_file: ~/.ssh/id_rsa
+
+observium_pve_target: pve2
+
+# VMID follows the lab convention: 10000 plus the last octet of the address.
+observium_vmid: 10011
+observium_vm_name: observium
+observium_cidr: 24
+observium_gateway: 192.168.1.1
+observium_nameserver: 192.168.1.1
+observium_searchdomain: example.lan
+
+observium_cores: 2
+observium_memory: 4096
+
+# Larger than the other guests: RRD files grow linearly with port count and are
+# never pruned. A 48-port switch alone is tens of thousands of files.
+observium_system_disk: 40G
+observium_storage: local-lvm
+
+# Debian 12, deliberately, not 13. Observium Community Edition ships twice a
+# year and trails Debian on PHP support; trixie brings PHP 8.4 and CE breaks on
+# it. Bookworm gives PHP 8.2, which CE supports. Do not "fix" this to trixie.
+observium_image_url: https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2
+observium_pubkey: "ssh-ed25519 AAAA... your-key"
+
+# MariaDB is local to this guest. Not on the data tier: the time series live in
+# RRD files on disk, and what the database holds is derived state that is
+# rebuilt by re-polling. No reason to widen the surface of the tier that matters.
+observium_db_password: "generate-me"
+
+observium_admin_user: admin
+observium_admin_password: "generate-me"
+
+# Network gear only. Hosts stay with Prometheus.
+# Fill this in after SNMP is enabled on the devices; until then leave it empty.
+observium_devices: []
+# observium_devices:
+#   - hostname: 192.168.1.2
+#     community: "your-read-only-community"
+#     version: v2c

@@ -1,0 +1,134 @@
+---
+# Создание геста под Observium из cloud-образа Debian.
+#
+# ⚠️ Образ здесь Debian 12, а не 13, как у остальных гестов лабы. Причина в
+# Observium: Community Edition выходит раз в полгода и по поддержке PHP отстаёт
+# от Debian. В trixie приезжает PHP 8.4, и на нём CE ломается на мелочах, а
+# чинить чужой legacy-код ради соответствия версии дистрибутива смысла нет.
+# Debian 12 даёт PHP 8.2, на котором CE работает штатно.
+#
+# Это осознанное отступление от общего правила, и оно записано здесь, чтобы при
+# следующем обновлении лабы кто-нибудь не "поправил" ссылку на trixie.
+#
+#   ansible-playbook -i inventory.ini create_observium.yml
+#   ansible-playbook -i inventory.ini create_observium.yml -e observium_pve_target=pve1
+
+- name: Provision the Observium guest on Proxmox
+  hosts: "{{ observium_pve_target | default('pve2') }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    ob: "{{ hostvars[groups['observium_group'] | first] }}"
+    ob_vmid: "{{ ob.observium_vmid }}"
+    ob_name: "{{ ob.observium_vm_name }}"
+    ob_ip: "{{ ob.ansible_host }}"
+    ob_image_path: "/var/lib/vz/template/{{ ob.observium_image_url | basename }}"
+
+  tasks:
+    - name: Fetch the Debian cloud image
+      get_url:
+        url: "{{ ob.observium_image_url }}"
+        dest: "{{ ob_image_path }}"
+        mode: '0644'
+
+    - name: Check whether the VMID is already taken
+      command: "qm config {{ ob_vmid }}"
+      register: ob_existing
+      changed_when: false
+      failed_when: false
+
+    - name: Create the virtual machine
+      command:
+        argv:
+          - qm
+          - create
+          - "{{ ob_vmid }}"
+          - --name
+          - "{{ ob_name }}"
+          - --memory
+          - "{{ ob.observium_memory }}"
+          - --cores
+          - "{{ ob.observium_cores }}"
+          - --sockets
+          - "1"
+          - --net0
+          - "virtio,bridge=vmbr0"
+          - --scsihw
+          - virtio-scsi-single
+          - --ostype
+          - l26
+          - --agent
+          - "1"
+          - --onboot
+          - "1"
+          - --description
+          - "Observium. SNMP monitoring of network gear only."
+      when: ob_existing.rc != 0
+
+    - name: Import the cloud image as the system disk
+      command: >-
+        qm set {{ ob_vmid }}
+        --scsi0 {{ ob.observium_storage }}:0,import-from={{ ob_image_path }},discard=on
+      when: ob_existing.rc != 0
+
+    # Диск больше, чем у NetBox: rrd-файлы растут линейно от числа портов и
+    # живут вечно. На 48-портовом свитче это десятки тысяч файлов.
+    - name: Grow the system disk
+      command: "qm disk resize {{ ob_vmid }} scsi0 {{ ob.observium_system_disk }}"
+      when: ob_existing.rc != 0
+
+    - name: Attach cloud-init and set the boot order
+      command: >-
+        qm set {{ ob_vmid }}
+        --ide2 {{ ob.observium_storage }}:cloudinit --boot order=scsi0
+      when: ob_existing.rc != 0
+
+    - name: Write the public key for cloud-init
+      copy:
+        content: "{{ ob.observium_pubkey }}\n"
+        dest: "/root/observium-{{ ob_vmid }}.pub"
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Apply user, key and static addressing
+      command:
+        argv:
+          - qm
+          - set
+          - "{{ ob_vmid }}"
+          - --ciuser
+          - "{{ ob.ansible_user }}"
+          - --sshkeys
+          - "/root/observium-{{ ob_vmid }}.pub"
+          - --ipconfig0
+          - "ip={{ ob_ip }}/{{ ob.observium_cidr }},gw={{ ob.observium_gateway }}"
+          - --nameserver
+          - "{{ ob.observium_nameserver }}"
+          - --searchdomain
+          - "{{ ob.observium_searchdomain }}"
+
+    - name: Start the guest
+      command: "qm start {{ ob_vmid }}"
+      register: ob_start
+      changed_when: "'already running' not in (ob_start.stderr | default(''))"
+      failed_when:
+        - ob_start.rc != 0
+        - "'already running' not in (ob_start.stderr | default(''))"
+
+    - name: Wait until SSH answers
+      wait_for:
+        host: "{{ ob_ip }}"
+        port: 22
+        timeout: 300
+        delay: 10
+      delegate_to: localhost
+      become: false
+
+    - name: Report
+      debug:
+        msg: >-
+          Гест {{ ob_vmid }} {{ ob_name }} на {{ inventory_hostname }},
+          адрес {{ ob_ip }}. Дальше:
+          ansible-playbook -i inventory.ini deploy_observium.yml
