@@ -1,0 +1,115 @@
+---
+# Инвентаризация физической сети без единого прикосновения к кабелю.
+#
+# Свитч знает, какой MAC живёт на каком порту, а каждый хост знает MAC своих
+# интерфейсов. Свести одно с другим достаточно, чтобы получить карту "порт
+# свитча -> машина -> интерфейс", то есть ровно то, ради чего обычно берут
+# звонилку и лезут за стойку.
+#
+# Плейбук ТОЛЬКО читает. Ни одной команды, меняющей конфигурацию, здесь нет,
+# все задачи помечены changed_when: false. Запускать можно в любой момент.
+#
+#   ansible-playbook discover_network.yml
+#
+# Результат складывается в discovery/ на управляющей машине (каталог в
+# .gitignore: там MAC-адреса и раскладка портов, публичному репо это ни к чему).
+
+- name: Collect the port map from the switch
+  hosts: net_switch_group
+  gather_facts: false
+
+  vars:
+    discovery_dir: "{{ playbook_dir }}/discovery"
+    # Команды подобраны так, чтобы вместе они давали связку
+    # порт -> MAC -> сосед -> скорость -> ошибки.
+    discovery_switch_commands:
+      - show version
+      - show interfaces status
+      - show mac address-table
+      - show cdp neighbors detail
+      - show lldp neighbors detail
+      - show interfaces counters errors
+      - show interfaces trunk
+      - show vlan brief
+      - show etherchannel summary
+      - show power inline
+
+  tasks:
+    - name: Create the discovery directory on the control node
+      file:
+        path: "{{ discovery_dir }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+      run_once: true
+      check_mode: false
+      changed_when: false
+
+    # ios_command выполняет только show-команды, менять конфигурацию он не умеет
+    # в принципе. Ошибки не глушим: если какой-то show не поддерживается этой
+    # платформой, лучше увидеть это сразу, чем гадать над пустым файлом.
+    - name: Read the switch state
+      cisco.ios.ios_command:
+        commands: "{{ discovery_switch_commands }}"
+      register: discovery_switch
+      changed_when: false
+      check_mode: false
+      ignore_errors: true
+
+    - name: Save the switch output on the control node
+      copy:
+        content: |
+          {% for cmd in discovery_switch_commands %}
+          ===== {{ cmd }} =====
+          {{ discovery_switch.stdout[loop.index0] | default('(команда не выполнилась)') }}
+
+          {% endfor %}
+        dest: "{{ discovery_dir }}/switch.txt"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      changed_when: false
+      when: discovery_switch.stdout is defined
+
+- name: Collect interface identity from the hypervisors
+  hosts: pve_all
+  gather_facts: false
+
+  vars:
+    discovery_dir: "{{ playbook_dir }}/discovery"
+
+  tasks:
+    # ip -o link даёт имя интерфейса и его MAC одной строкой на интерфейс,
+    # bridge link показывает, какой физический порт входит в какой мост.
+    # Вместе это позволяет протянуть MAC с порта свитча до конкретного гнезда
+    # в конкретном сервере.
+    - name: Read link names, MAC addresses and bridge membership
+      shell: |
+        echo "----- ip -o link -----"
+        ip -o link
+        echo "----- bridge link -----"
+        bridge link 2>/dev/null || true
+        echo "----- ethtool per nic -----"
+        for i in $(ls /sys/class/net); do
+          case "$i" in lo|vmbr*|tap*|veth*|fwbr*|fwln*|fwpr*|bonding_masters) continue;; esac
+          echo "== $i =="
+          cat "/sys/class/net/$i/address" 2>/dev/null | sed 's/^/mac: /'
+          cat "/sys/class/net/$i/operstate" 2>/dev/null | sed 's/^/state: /'
+          ethtool "$i" 2>/dev/null | grep -E "Speed|Duplex|Auto-negotiation|Link detected|Port:" | sed 's/^ *//'
+          ethtool -i "$i" 2>/dev/null | grep -E "^driver|^bus-info"
+        done
+      register: discovery_host
+      changed_when: false
+      check_mode: false
+
+    - name: Save the host output on the control node
+      copy:
+        content: "{{ discovery_host.stdout }}\n"
+        dest: "{{ discovery_dir }}/host-{{ inventory_hostname }}.txt"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      check_mode: false
+      changed_when: false

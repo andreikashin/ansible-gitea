@@ -11,3 +11,6 @@ secrets.yaml
 *.env
 *.log
 .claude/settings.local.json
+# Карта портов и MAC-адресов, снятая discover_network.yml. Внутренняя
+# раскладка, публичному репо не нужна.
+discovery/
