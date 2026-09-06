@@ -7,14 +7,16 @@
 # Silence понадобится буквально на следующей замене диска: массив уйдёт в
 # rebuild и покраснеет всё разом. Заглушить на два часа приятнее, чем смотреть.
 #
-{% if lab_telegram_bot_token is defined and lab_telegram_chat_id is defined %}
-# Доставка в Telegram включена. Бот переиспользуется тот же, что у продуктового
-# бота: заводить второго ради одного оператора незачем. Чат при этом личный, а
-# не групповой канал выгрузок, чтобы алерты не тонули среди данных.
-#
-# Плата за общий токен: компрометация машины с продуктовым ботом даёт заодно
-# возможность слать поддельные алерты. Для домашней лабы приемлемо, а если
-# разделять, менять надо ровно две переменные в host_vars.
+{% set alert_delivery_enabled = (alert_dispatcher_port is defined) or (lab_telegram_bot_token is defined and lab_telegram_chat_id is defined) %}
+{% if alert_dispatcher_port is defined %}
+# Доставка алертов идёт через интеграционный хаб lab_alert-dispatcher:
+# он обогащает сообщения интерактивными inline-кнопками управления (подсветка
+# корзины, мигание UID шасси, создание silences в Alertmanager в один клик).
+{% elif lab_telegram_bot_token is defined and lab_telegram_chat_id is defined %}
+# Доставка в Telegram включена напрямую (fallback без интерактивных кнопок).
+# Бот переиспользуется тот же, что у продуктового бота: заводить второго ради
+# одного оператора незачем. Чат при этом личный, а не групповой канал выгрузок,
+# чтобы алерты не тонули среди данных.
 {% else %}
 # Доставка наружу не настроена: алерты видны только в уголке лаб-дашборда,
 # который читает /api/v2/alerts отсюда. Чтобы включить Telegram, задай
@@ -25,11 +27,11 @@ global:
   resolve_timeout: 5m
 
 route:
-  receiver: {{ 'lab-telegram' if lab_telegram_bot_token is defined else 'lab-null' }}
+  receiver: {{ 'lab-telegram' if alert_delivery_enabled else 'lab-null' }}
   group_by: ['alertname', 'node']
   group_wait: 30s
   group_interval: 5m
-{% if lab_telegram_bot_token is defined %}
+{% if alert_delivery_enabled %}
   # Двенадцать часов вместо суток: висящий алерт должен напоминать о себе, но не
   # долбить. Сутки стояли, пока доставки не было вовсе.
   repeat_interval: 12h
@@ -39,7 +41,7 @@ route:
 {% endif %}
 
   routes:
-{% if lab_telegram_bot_token is defined %}
+{% if alert_delivery_enabled %}
     # В мессенджер уходит ТОЛЬКО critical. Если слать всё, через месяц чат
     # замьютят, и канал доставки перестанет существовать. Warning остаётся в
     # уголке дашборда и в Grafana, там он и нужен.
@@ -59,7 +61,12 @@ route:
 receivers:
   - name: lab-null
 
-{% if lab_telegram_bot_token is defined and lab_telegram_chat_id is defined %}
+{% if alert_dispatcher_port is defined %}
+  - name: lab-telegram
+    webhook_configs:
+      - url: "http://{{ obs_ip }}:{{ alert_dispatcher_port }}/webhook/alertmanager{% if alertmanager_webhook_secret is defined and alertmanager_webhook_secret %}?secret={{ alertmanager_webhook_secret }}{% endif %}"
+        send_resolved: true
+{% elif lab_telegram_bot_token is defined and lab_telegram_chat_id is defined %}
   - name: lab-telegram
     telegram_configs:
       - bot_token: '{{ lab_telegram_bot_token }}'
