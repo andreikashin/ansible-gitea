@@ -1,0 +1,14 @@
+# Шаблон переменных для джамп-хоста CONSOLE (Windows Server 2016)
+# Скопируйте в host_vars/console_node.yml и заполните пароль/пользователя.
+
+ansible_host: 192.168.1.208
+ansible_user: "{{ admin_login | default('Administrator') }}"
+ansible_password: "{{ admin_password }}"
+ansible_connection: winrm
+ansible_port: 5985
+ansible_winrm_transport: ntlm
+ansible_winrm_server_cert_validation: ignore
+ansible_winrm_read_timeout_sec: 30
+ansible_winrm_operation_timeout_sec: 20
+
+console_expected_ip_forward: 0

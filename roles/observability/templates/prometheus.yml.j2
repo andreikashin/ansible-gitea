@@ -44,3 +44,24 @@ scrape_configs:
       - targets: ['{{ obs_ip }}:{{ alert_dispatcher_port }}']
 {% endif %}
 
+{% set c_ip = obs_console_node_ip | default(console_node_ip | default('')) %}
+{% if c_ip %}
+  - job_name: blackbox-tcp
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets:
+          - '{{ c_ip }}:{{ obs_console_probe_port | default(console_probe_port | default(3389)) }}'
+        labels:
+          node: console
+          service: rdp
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox-exporter:9115
+{% endif %}
+

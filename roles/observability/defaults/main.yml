@@ -32,3 +32,8 @@ obs_images:
   prometheus: prom/prometheus:v3.7.3
   alertmanager: prom/alertmanager:v0.28.1
   grafana: grafana/grafana:12.3.1
+  blackbox: prom/blackbox-exporter:v0.25.0
+
+# Джамп-хост управления CONSOLE (Windows Server 2016, связь с VLAN 2 IPMI)
+console_node_ip: "192.168.1.208"
+console_probe_port: 3389

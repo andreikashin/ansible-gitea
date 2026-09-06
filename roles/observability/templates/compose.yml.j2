@@ -39,6 +39,14 @@ services:
       - "{{ obs_alertmanager_port }}:9093"
     networks: [obs_net]
 
+  blackbox-exporter:
+    image: {{ obs_images.blackbox }}
+    container_name: obs_blackbox
+    restart: always
+    volumes:
+      - {{ obs_install_dir }}/blackbox:/etc/blackbox_exporter:ro
+    networks: [obs_net]
+
   grafana:
     image: {{ obs_images.grafana }}
     container_name: obs_grafana

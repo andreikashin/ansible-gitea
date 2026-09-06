@@ -10,6 +10,7 @@
     - "{{ obs_install_dir }}/prometheus/rules"
     - "{{ obs_install_dir }}/prometheus/targets"
     - "{{ obs_install_dir }}/alertmanager"
+    - "{{ obs_install_dir }}/blackbox"
     - "{{ obs_install_dir }}/grafana/provisioning/datasources"
     - "{{ obs_install_dir }}/grafana/provisioning/dashboards"
     - "{{ obs_install_dir }}/grafana/dashboards"
@@ -59,6 +60,13 @@
     dest: "{{ obs_install_dir }}/alertmanager/alertmanager.yml"
     mode: '0644'
   notify: Reload Alertmanager
+
+- name: Generate Blackbox exporter config
+  template:
+    src: blackbox.yml.j2
+    dest: "{{ obs_install_dir }}/blackbox/config.yml"
+    mode: '0644'
+  notify: Restart stack
 
 - name: Generate Grafana datasource provisioning
   template:

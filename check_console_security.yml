@@ -1,0 +1,80 @@
+---
+# Проверка безопасности и изоляции джамп-хоста CONSOLE (192.168.1.208).
+#
+# Требование безопасности описано в §10.4 плана лабы:
+# Консольная машина физически подключена двумя адаптерами в разные сети:
+#   - Ethernet: нероутируемый изолированный VLAN 2 (IPMI / iLO 192.168.2.0/24)
+#   - Wi-Fi: рабочая сеть / VLAN 30 (192.168.1.208)
+#
+# КРИТИЧЕСКИ ВАЖНО: маршрутизация (ip_forward / IPEnableRouter) ОБЯЗАНА быть
+# выключена (0), служба RemoteAccess отключена. Иначе Windows сшивает IPMI
+# с общей сетью и полностью уничтожает изоляцию управления серверами.
+#
+# Запуск:
+#   ansible-playbook -i inventory.ini -e @secrets.yml check_console_security.yml
+
+- name: Audit and enforce CONSOLE security & IPMI isolation
+  hosts: console_group
+  gather_facts: false
+
+  tasks:
+    - name: Query IPEnableRouter registry key
+      ansible.windows.win_reg_stat:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: IPEnableRouter
+      register: ip_enable_router_stat
+
+    - name: Ensure IPEnableRouter is strictly disabled (0)
+      ansible.windows.win_regedit:
+        path: HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters
+        name: IPEnableRouter
+        data: 0
+        type: dword
+        state: present
+      register: reg_fix
+
+    - name: Verify IPEnableRouter was already 0
+      ansible.builtin.assert:
+        that:
+          - ip_enable_router_stat.exists
+          - ip_enable_router_stat.value == 0
+        fail_msg: >-
+          КРИТИЧЕСКАЯ УЯЗВИМОСТЬ: IPEnableRouter был равен {{ ip_enable_router_stat.value | default('not set') }}.
+          Маршрутизация между LAN и изолированным VLAN 2 (iLO) была активна! Значение сброшено в 0.
+        success_msg: "OK: IPEnableRouter = 0 (маршрутизация пакетов в iLO отключена)."
+
+    - name: Ensure RemoteAccess service is stopped and disabled
+      ansible.windows.win_service:
+        name: RemoteAccess
+        start_mode: disabled
+        state: stopped
+
+    - name: Query network adapters and IP configurations
+      ansible.windows.win_powershell:
+        script: |
+          Get-NetIPAddress -AddressFamily IPv4 |
+            Where-Object { $_.InterfaceAlias -notlike "*Loopback*" } |
+            Select-Object InterfaceAlias, IPAddress, PrefixLength |
+            ConvertTo-Json
+      register: net_adapters_result
+
+    - name: Query Windows Firewall profile status
+      ansible.windows.win_powershell:
+        script: |
+          Get-NetFirewallProfile |
+            Select-Object Name, Enabled |
+            ConvertTo-Json
+      register: fw_profiles_result
+
+    - name: Display security compliance summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================================"
+          - "CONSOLE (192.168.1.208) Security Audit Passed"
+          - "IP Routing (IPEnableRouter): DISABLED (0)"
+          - "RemoteAccess Service:        STOPPED & DISABLED"
+          - "Network Interfaces:"
+          - "{{ net_adapters_result.output | default([]) }}"
+          - "Firewall Profiles:"
+          - "{{ fw_profiles_result.output | default([]) }}"
+          - "========================================================"
